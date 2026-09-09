@@ -1,0 +1,40 @@
+{
+  "name": "findmyink-collector",
+  "version": "0.3.0",
+  "private": true,
+  "description": "FindMyInk desktop collector: comuni italiani, Chromium integrato, dedup globale e Google Sheet bridge senza OAuth nell'app.",
+  "main": "main/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test tests/*.test.js",
+    "dist": "electron-builder",
+    "dist:mac": "electron-builder --mac --x64 --arm64",
+    "dist:win": "electron-builder --win --x64 --arm64",
+    "postinstall": "electron-builder install-app-deps"
+  },
+  "build": {
+    "appId": "it.findmyink.collector",
+    "productName": "FindMyInk Collector",
+    "asar": true,
+    "asarUnpack": ["node_modules/better-sqlite3/**"],
+    "files": ["main/**/*", "renderer/dist/**/*", "apps-script/**/*", "package.json", "node_modules/**/*"],
+    "directories": {"output": "release", "buildResources": "assets"},
+    "mac": {
+      "category": "public.app-category.business",
+      "target": [
+        {"target": "dmg", "arch": ["x64", "arm64"]},
+        {"target": "zip", "arch": ["x64", "arm64"]}
+      ]
+    },
+    "win": {
+      "target": [
+        {"target": "nsis", "arch": ["x64", "arm64"]},
+        {"target": "portable", "arch": ["x64", "arm64"]}
+      ]
+    },
+    "nsis": {"oneClick": false, "allowToChangeInstallationDirectory": true}
+  },
+  "dependencies": {"better-sqlite3": "latest"},
+  "devDependencies": {"electron": "latest", "electron-builder": "latest"}
+}
