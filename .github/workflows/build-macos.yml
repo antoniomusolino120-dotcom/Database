@@ -6,6 +6,7 @@ on:
     branches: [main]
     paths:
       - '.bootstrap/**'
+      - '.hotfix/**'
       - '.github/workflows/build-macos.yml'
 
 permissions:
@@ -20,20 +21,35 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Reconstruct and verify V3.2 source
+      - name: Reconstruct verified V3 base
         shell: bash
         run: |
+          BASE_COMMIT="edc8c985e9e2f6e9bc205e24889ff2169dd696cd"
+          git fetch --depth=1 origin "$BASE_COMMIT"
+          mkdir -p /tmp/fmi-v3-parts
+          for n in 00 01 02 03 04; do
+            git show "$BASE_COMMIT:.bootstrap/source.part${n}.b64" > "/tmp/fmi-v3-parts/source.part${n}.b64"
+          done
           python3 - <<'PY'
           import base64, pathlib
-          parts = sorted(pathlib.Path('.bootstrap').glob('source.part*.b64'))
-          if len(parts) != 5:
-              raise SystemExit(f'Expected 5 source parts, found {len(parts)}')
-          encoded = b''.join(p.read_bytes() for p in parts)
-          pathlib.Path('source.zip').write_bytes(base64.b64decode(encoded, validate=True))
+          parts = [pathlib.Path(f'/tmp/fmi-v3-parts/source.part{i:02d}.b64').read_bytes() for i in range(5)]
+          # The original verified transfer lost exactly one byte in part03.
+          if len(parts[3]) == 8999:
+              parts[3] = parts[3][:2408] + b'n' + parts[3][2408:]
+          pathlib.Path('source.zip').write_bytes(base64.b64decode(b''.join(parts), validate=True))
           PY
-          echo "0c45204e5c06b654db34884905bfed1598e232c4cc9e4664b8a78fc9443e7456  source.zip" | shasum -a 256 -c -
+          echo "a98699a516c7f07cc553075d40d595691cced918c4cf71b90c53d8c450dd119c  source.zip" | shasum -a 256 -c -
           unzip -q source.zip
           test -f findmyink-collector/package.json
+
+      - name: Apply V3.2 recovery hotfix
+        shell: bash
+        run: |
+          python3 .hotfix/patch_v32.py
+          grep -q '"version": "0.3.2"' findmyink-collector/package.json
+          node --check findmyink-collector/main/services/browserCollector.js
+          node --check findmyink-collector/main/services/collectorEngine.js
+          node --check findmyink-collector/main/index.js
 
       - name: Setup Node
         uses: actions/setup-node@v4
