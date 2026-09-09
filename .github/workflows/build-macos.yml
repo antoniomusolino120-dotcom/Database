@@ -1,0 +1,72 @@
+name: Build FindMyInk Collector macOS
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.bootstrap/**'
+      - '.github/workflows/build-macos.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  macos-arm64:
+    runs-on: macos-15
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Reconstruct verified V3 source
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64, pathlib
+          parts = sorted(pathlib.Path('.bootstrap').glob('source.part*.b64'))
+          if len(parts) != 5:
+              raise SystemExit(f'Expected 5 source parts, found {len(parts)}')
+          encoded = b''.join(p.read_bytes() for p in parts)
+          pathlib.Path('source.zip').write_bytes(base64.b64decode(encoded, validate=True))
+          PY
+          echo "a98699a516c7f07cc553075d40d595691cced918c4cf71b90c53d8c450dd119c  source.zip" | shasum -a 256 -c -
+          unzip -q source.zip
+          test -f findmyink-collector/package.json
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: findmyink-collector/package-lock.json
+
+      - name: Install dependencies
+        working-directory: findmyink-collector
+        run: npm install
+
+      - name: Run tests
+        working-directory: findmyink-collector
+        run: npm test
+
+      - name: Build DMG Apple Silicon
+        working-directory: findmyink-collector
+        run: npx electron-builder --mac dmg --arm64
+
+      - name: Verify DMG
+        working-directory: findmyink-collector
+        shell: bash
+        run: |
+          ls -lah release
+          DMG="$(find release -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          test -n "$DMG"
+          shasum -a 256 "$DMG"
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: FindMyInk-Collector-V3-macOS-Apple-Silicon
+          path: findmyink-collector/release/*.dmg
+          if-no-files-found: error
+          compression-level: 0
