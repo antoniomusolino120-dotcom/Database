@@ -20,7 +20,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Reconstruct and verify V3 source
+      - name: Reconstruct and verify V3.2 source
         shell: bash
         run: |
           python3 - <<'PY'
@@ -28,16 +28,10 @@ jobs:
           parts = sorted(pathlib.Path('.bootstrap').glob('source.part*.b64'))
           if len(parts) != 5:
               raise SystemExit(f'Expected 5 source parts, found {len(parts)}')
-          raw = [p.read_bytes() for p in parts]
-          # source.part03 lost one byte during the first repository transfer.
-          # Restore the byte whose position was determined by the Git blob SHA,
-          # then verify the complete ZIP by its independent SHA-256 below.
-          if len(raw[3]) == 8999:
-              raw[3] = raw[3][:2408] + b'n' + raw[3][2408:]
-          encoded = b''.join(raw)
+          encoded = b''.join(p.read_bytes() for p in parts)
           pathlib.Path('source.zip').write_bytes(base64.b64decode(encoded, validate=True))
           PY
-          echo "a98699a516c7f07cc553075d40d595691cced918c4cf71b90c53d8c450dd119c  source.zip" | shasum -a 256 -c -
+          echo "0c45204e5c06b654db34884905bfed1598e232c4cc9e4664b8a78fc9443e7456  source.zip" | shasum -a 256 -c -
           unzip -q source.zip
           test -f findmyink-collector/package.json
 
@@ -70,7 +64,7 @@ jobs:
       - name: Upload DMG
         uses: actions/upload-artifact@v4
         with:
-          name: FindMyInk-Collector-V3-macOS-Apple-Silicon
+          name: FindMyInk-Collector-V3.2-macOS-Apple-Silicon
           path: findmyink-collector/release/*.dmg
           if-no-files-found: error
           compression-level: 0
