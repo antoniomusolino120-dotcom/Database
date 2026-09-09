@@ -1,0 +1,12 @@
+FINDMYINK COLLECTOR — BRIDGE GOOGLE SHEET (una sola volta)
+
+1. Apri il Google Sheet master.
+2. Estensioni > Apps Script.
+3. Sostituisci Code.gs con il contenuto di questo file Code.gs.
+4. Distribuisci > Nuova distribuzione > Applicazione web.
+5. Esegui come: Me.
+6. Accesso: Chiunque.
+7. Distribuisci e copia l'URL che termina in /exec.
+8. Nel Collector > Impostazioni > Google Sheet, incolla quell'URL e premi Testa e salva.
+
+Da quel momento il Collector non usa OAuth, login Google o credentials.json.
