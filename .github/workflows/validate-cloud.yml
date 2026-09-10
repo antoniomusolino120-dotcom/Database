@@ -2,10 +2,11 @@ name: Validate Cloud Collector
 
 on:
   push:
-    branches: [collector-shared-queue-cloud]
+    branches: [collector-shared-queue-cloud, main]
     paths:
       - 'cloud/**'
       - 'apps-script/Code.gs'
+      - 'apps-script/dashboard.html'
       - '.github/workflows/cloud-collector.yml'
       - '.github/workflows/validate-cloud.yml'
 
@@ -46,8 +47,8 @@ jobs:
           node --check findmyink-collector/cloud/worker.mjs
           node --check findmyink-collector/cloud/finalizer.mjs
           node --check findmyink-collector/cloud/dedup.mjs
-          cp apps-script/Code.gs /tmp/findmyink-code.js
-          node --check /tmp/findmyink-code.js
+          cp apps-script/Code.gs /tmp/database-code.js
+          node --check /tmp/database-code.js
 
       - name: Cloud dedup tests
         working-directory: findmyink-collector
