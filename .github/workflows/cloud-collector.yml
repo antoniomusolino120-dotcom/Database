@@ -19,10 +19,6 @@ on:
         required: true
         default: '0'
         type: string
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/cloud-collector.yml'
 
 permissions:
   contents: read
@@ -32,31 +28,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  probe:
-    if: ${{ github.event_name == 'push' }}
-    runs-on: ubuntu-latest
-    env:
-      SHEET_ENDPOINT: ${{ secrets.SHEET_ENDPOINT }}
-    steps:
-      - name: Probe Apps Script bridge
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -n "$SHEET_ENDPOINT" || (echo 'Missing repository secret SHEET_ENDPOINT' && exit 1)
-          response=$(curl --fail-with-body --silent --show-error --location --max-time 60 \
-            -H 'Content-Type: text/plain;charset=utf-8' \
-            --data-binary '{"action":"ping"}' \
-            "$SHEET_ENDPOINT")
-          RESPONSE="$response" python3 - <<'PY'
-          import json, os
-          data=json.loads(os.environ['RESPONSE'])
-          if not data.get('ok'):
-              raise SystemExit(data)
-          print('Apps Script bridge OK:', data.get('title'), data.get('spreadsheetId'))
-          PY
-
   matrix:
-    if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     outputs:
       workers: ${{ steps.matrix.outputs.workers }}
@@ -71,7 +43,6 @@ jobs:
           fi
 
   init:
-    if: ${{ github.event_name == 'workflow_dispatch' }}
     needs: matrix
     runs-on: ubuntu-latest
     env:
@@ -102,7 +73,6 @@ jobs:
           PY
 
   worker:
-    if: ${{ github.event_name == 'workflow_dispatch' }}
     needs: [matrix, init]
     timeout-minutes: 355
     runs-on: ubuntu-latest
@@ -176,8 +146,8 @@ jobs:
           retention-days: 1
 
   close:
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && needs.init.result == 'success' }}
     needs: [matrix, init, worker]
+    if: ${{ always() && needs.init.result == 'success' }}
     runs-on: ubuntu-latest
     env:
       SHEET_ENDPOINT: ${{ secrets.SHEET_ENDPOINT }}
