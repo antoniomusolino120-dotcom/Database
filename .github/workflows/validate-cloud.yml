@@ -47,12 +47,13 @@ jobs:
           node --check findmyink-collector/cloud/worker.mjs
           node --check findmyink-collector/cloud/finalizer.mjs
           node --check findmyink-collector/cloud/dedup.mjs
+          node --check findmyink-collector/cloud/italy-filter.mjs
           cp apps-script/Code.gs /tmp/database-code.js
           node --check /tmp/database-code.js
 
-      - name: Cloud dedup tests
+      - name: Cloud safety tests
         working-directory: findmyink-collector
-        run: node --test cloud/dedup.test.mjs cloud/apps-script-dedup.test.mjs
+        run: node --test cloud/dedup.test.mjs cloud/apps-script-dedup.test.mjs cloud/italy-filter.test.mjs
 
       - name: Setup Node
         uses: actions/setup-node@v4
