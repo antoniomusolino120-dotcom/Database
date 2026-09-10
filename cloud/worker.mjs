@@ -12,6 +12,7 @@ const ENDPOINT = String(process.env.SHEET_ENDPOINT || '').trim();
 const WORKER_INDEX = Number(process.env.WORKER_INDEX || 0);
 const WORKER_COUNT = Number(process.env.WORKER_COUNT || 3);
 const MAX_MINUTES = Math.min(330, Math.max(5, Number(process.env.MAX_MINUTES || 300)));
+const MAX_MUNICIPALITIES = Math.max(0, Number(process.env.MAX_MUNICIPALITIES || 0));
 const BATCH_SIZE = Math.max(1, Math.min(25, Number(process.env.WORK_BATCH_SIZE || 8)));
 const QUERIES = String(process.env.MAPS_QUERIES || 'tattoo,tatuatore,tattoo studio,studio tatuaggi,tattoo artist')
   .split(',').map(x => x.trim()).filter(Boolean);
@@ -24,7 +25,8 @@ const SETTINGS = {
   maxScrollsPerQuery: Number(process.env.MAX_SCROLLS_PER_QUERY || 60),
 };
 
-const log = (event, meta={}) => console.log(JSON.stringify({ts:new Date().toISOString(),worker:WORKER_INDEX,event,...meta}));
+const WORKER_ID = `run-${process.env.GITHUB_RUN_ID || Date.now()}-w${WORKER_INDEX}`;
+const log = (event, meta={}) => console.log(JSON.stringify({ts:new Date().toISOString(),worker:WORKER_INDEX,workerId:WORKER_ID,event,...meta}));
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function sheet(action, payload={}, attempts=4) {
@@ -92,9 +94,13 @@ async function run() {
 
   await browser.open();
   let completed = 0;
+  let attempted = 0;
 
+  outer:
   while (Date.now() < deadline) {
-    const work = await sheet('getCloudWork', {workerIndex:WORKER_INDEX, workerCount:WORKER_COUNT, limit:BATCH_SIZE});
+    if (MAX_MUNICIPALITIES && attempted >= MAX_MUNICIPALITIES) break;
+    const remaining = MAX_MUNICIPALITIES ? Math.max(1, Math.min(BATCH_SIZE, MAX_MUNICIPALITIES - attempted)) : BATCH_SIZE;
+    const work = await sheet('getCloudWork', {workerIndex:WORKER_INDEX, workerCount:WORKER_COUNT, limit:remaining});
     const municipalities = work.rows || [];
     if (!municipalities.length) {
       log('queue-empty');
@@ -102,10 +108,13 @@ async function run() {
     }
 
     for (const municipality of municipalities) {
-      if (Date.now() >= deadline) break;
+      if (Date.now() >= deadline) break outer;
+      if (MAX_MUNICIPALITIES && attempted >= MAX_MUNICIPALITIES) break outer;
+      attempted++;
       let found = 0, newCount = 0, duplicates = 0, foreign = 0;
       const seenThisMunicipality = new Set();
-      log('municipality-start', {queueCode:municipality.queueCode, municipalityId:municipality.municipalityId, name:municipality.name});
+      const claimedThisMunicipality = new Set();
+      log('municipality-start', {queueCode:municipality.queueCode, municipalityId:municipality.municipalityId, name:municipality.name, attempted});
 
       try {
         for (const variant of QUERIES) {
@@ -117,20 +126,43 @@ async function run() {
           found += links.length;
           log('query-links', {queueCode:municipality.queueCode, query, count:links.length});
 
+          const pending = [];
           for (const link of links) {
-            if (Date.now() >= deadline) throw new Error('__TIME_LIMIT__');
             const key = linkKey(link);
             const compactUrl = normalizeMapsUrl(link);
             const localFingerprint = key || compactUrl;
 
-            // Fast path: skip before opening the place card when MASTER (or this worker) already knows it.
+            // Fast path locale: MASTER iniziale + risultati già gestiti da questo worker/comune.
             if ((key && knownKeys.has(key)) || knownUrls.has(compactUrl) || seenThisMunicipality.has(localFingerprint)) {
               duplicates++;
               continue;
             }
             if (localFingerprint) seenThisMunicipality.add(localFingerprint);
+            pending.push({link,key,compactUrl});
+          }
 
-            const candidate = await browser.extractPlace(link, SETTINGS);
+          // Fast path condivisa: prima di aprire le schede, un solo worker può prenotare ciascun Maps Key/CID.
+          const reservable = pending.filter(item => item.key);
+          const reservation = reservable.length
+            ? await sheet('reserveCloudCandidates', {keys:reservable.map(item => item.key), workerId:WORKER_ID})
+            : {claimed:[],known:[],busy:[]};
+          const claimed = new Set(reservation.claimed || []);
+          for (const key of reservation.known || []) knownKeys.add(String(key));
+          duplicates += (reservation.known || []).length + (reservation.busy || []).length;
+          for (const key of claimed) claimedThisMunicipality.add(String(key));
+          log('preclick-dedup', {
+            queueCode:municipality.queueCode,
+            candidates:pending.length,
+            claimed:claimed.size,
+            known:(reservation.known||[]).length,
+            busy:(reservation.busy||[]).length
+          });
+
+          for (const item of pending) {
+            if (Date.now() >= deadline) throw new Error('__TIME_LIMIT__');
+            if (item.key && !claimed.has(item.key)) continue;
+
+            const candidate = await browser.extractPlace(item.link, SETTINGS);
             if (candidate.verification) throw new Error('GOOGLE_VERIFICATION_REQUIRED');
             if (!candidate.name || !isTattoo(candidate)) continue;
             if (isExplicitForeign(candidate.address)) { foreign++; continue; }
@@ -156,24 +188,24 @@ async function run() {
         completed++;
         log('municipality-complete', {queueCode:municipality.queueCode, found, newCount, duplicates, foreign, completed});
       } catch (err) {
+        // Il comune resta TODO e L resta invariata: al prossimo run ricomincia dall'inizio.
+        if (claimedThisMunicipality.size) {
+          await sheet('releaseCloudCandidates', {keys:[...claimedThisMunicipality], workerId:WORKER_ID}).catch(()=>{});
+        }
         if (err.message === '__TIME_LIMIT__') {
           log('time-limit', {queueCode:municipality.queueCode});
           await sheet('failCloudMunicipality', {municipalityId:municipality.municipalityId, error:'Interrotto per limite temporale GitHub Actions'}).catch(()=>{});
-          await browser.close().catch(()=>{});
-          return;
+          break outer;
         }
         await sheet('failCloudMunicipality', {municipalityId:municipality.municipalityId, error:err.message}).catch(()=>{});
         log('municipality-error', {queueCode:municipality.queueCode, error:err.message});
-        if (err.message === 'GOOGLE_VERIFICATION_REQUIRED') {
-          await browser.close().catch(()=>{});
-          return;
-        }
+        if (err.message === 'GOOGLE_VERIFICATION_REQUIRED') break outer;
       }
     }
   }
 
   await browser.close().catch(()=>{});
-  log('worker-done', {completed});
+  log('worker-done', {completed, attempted});
 }
 
 run().then(() => app.quit()).catch(err => {

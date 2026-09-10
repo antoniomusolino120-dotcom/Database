@@ -9,6 +9,11 @@ on:
         default: '3'
         type: choice
         options: ['3','5']
+      municipalities_per_worker:
+        description: 'Comuni massimi per worker (0 = fino al limite temporale)'
+        required: true
+        default: '1'
+        type: string
       max_minutes:
         description: 'Durata massima per worker (max 330)'
         required: true
@@ -49,6 +54,7 @@ jobs:
       WORKER_INDEX: ${{ matrix.worker }}
       WORKER_COUNT: ${{ inputs.workers }}
       MAX_MINUTES: ${{ inputs.max_minutes }}
+      MAX_MUNICIPALITIES: ${{ inputs.municipalities_per_worker }}
       WORK_BATCH_SIZE: '8'
     steps:
       - name: Checkout

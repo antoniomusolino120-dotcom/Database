@@ -27,6 +27,11 @@ function findRow_(sh,col,value){
   return finder?finder.getRow():-1;
 }
 
+function withScriptLock_(fn,waitMs){
+  const lock=LockService.getScriptLock(); lock.waitLock(waitMs||30000);
+  try{return fn();}finally{lock.releaseLock();}
+}
+
 function masterValues_(r){return [r.id||'',r.name||'',r.phone||'',r.website||'',r.address||'',r.lat??'',r.lng??'',r.mapsKey||'',r.mapsUrl||'',r.firstSeen||'',r.lastSeen||''];}
 function municipalityValues_(r){return [r.queueCode||'',r.municipalityId||'',r.name||'',r.province||'',r.provinceCode||'',r.region||'',r.status||'',r.foundCount??0,r.newCount??0,r.duplicateCount??0,r.foreignCount??0,r.lastScanAt||'',r.errorText||''];}
 
@@ -98,6 +103,42 @@ function getCloudDedupIndex_(){
   return {mapsKeys:keys,mapsUrls:urls};
 }
 
+function cloudCacheKey_(key){return `fmi:${String(key||'').slice(0,235)}`;}
+
+function reserveCloudCandidates_(data){
+  const workerId=String(data.workerId||'').trim();
+  if(!workerId)throw new Error('workerId obbligatorio');
+  const keys=[...new Set((data.keys||[]).map(v=>String(v||'').trim()).filter(Boolean))];
+  if(!keys.length)return {claimed:[],known:[],busy:[]};
+  return withScriptLock_(()=>{
+    // Rilettura live di MASTER!H dentro il lock: elimina la race fra snapshot dei worker.
+    const sh=ensureSheet_('MASTER',HEADERS.MASTER); const last=sh.getLastRow();
+    const persisted=new Set(last>=2?sh.getRange(2,8,last-1,1).getValues().flat().map(v=>String(v||'').trim()).filter(Boolean):[]);
+    const cache=CacheService.getScriptCache();
+    const cacheKeys=keys.map(cloudCacheKey_); const current=cache.getAll(cacheKeys);
+    const claimed=[]; const known=[]; const busy=[]; const puts={};
+    keys.forEach((key,i)=>{
+      if(persisted.has(key)){known.push(key);return;}
+      const ck=cacheKeys[i]; const owner=current[ck];
+      if(owner&&owner!==workerId){busy.push(key);return;}
+      claimed.push(key); puts[ck]=workerId;
+    });
+    if(Object.keys(puts).length)cache.putAll(puts,21600);
+    return {claimed,known,busy};
+  },45000);
+}
+
+function releaseCloudCandidates_(data){
+  const workerId=String(data.workerId||'').trim();
+  const keys=[...new Set((data.keys||[]).map(v=>String(v||'').trim()).filter(Boolean))];
+  if(!workerId||!keys.length)return {released:0};
+  return withScriptLock_(()=>{
+    const cache=CacheService.getScriptCache(); let released=0;
+    keys.forEach(key=>{const ck=cloudCacheKey_(key);if(cache.get(ck)===workerId){cache.remove(ck);released++;}});
+    return {released};
+  },30000);
+}
+
 function nextFmiId_(values){
   let max=0;
   values.forEach(r=>{const m=String(r[0]||'').match(/^FMI-(\d+)$/i);if(m)max=Math.max(max,Number(m[1])||0);});
@@ -149,6 +190,7 @@ function failCloudMunicipality_(data){
   const lock=LockService.getScriptLock(); lock.waitLock(30000);
   try{
     const sh=ensureSheet_('COMUNI',HEADERS.COMUNI); const row=findRow_(sh,2,data.municipalityId); if(row<0)throw new Error('Municipality ID non trovato');
+    // G resta TODO e L non viene toccata. Aggiorniamo soltanto l'errore in M.
     sh.getRange(row,13).setValue(String(data.error||'Errore worker cloud').slice(0,500));
     return {sheetRow:row};
   }finally{lock.releaseLock();}
@@ -162,6 +204,8 @@ function doPost(e){
     if(action==='ping'){const ss=book_();return json_({ok:true,spreadsheetId:SPREADSHEET_ID,title:ss.getName()});}
     if(action==='getCloudWork')return json_({ok:true,rows:getCloudWork_(data)});
     if(action==='getCloudDedupIndex')return json_({ok:true,...getCloudDedupIndex_()});
+    if(action==='reserveCloudCandidates')return json_({ok:true,...reserveCloudCandidates_(data)});
+    if(action==='releaseCloudCandidates')return json_({ok:true,...releaseCloudCandidates_(data)});
     if(action==='upsertCloudMaster')return json_({ok:true,...upsertCloudMaster_(data.row||{})});
     if(action==='completeCloudMunicipality')return json_({ok:true,...completeCloudMunicipality_(data)});
     if(action==='failCloudMunicipality')return json_({ok:true,...failCloudMunicipality_(data)});
