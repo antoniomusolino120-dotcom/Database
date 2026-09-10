@@ -1,4 +1,4 @@
-name: FindMyInk Cloud Collector
+name: Database Cloud Scraper
 
 on:
   workflow_dispatch:
@@ -14,12 +14,17 @@ on:
         required: true
         default: '300'
         type: string
+      max_municipalities_per_worker:
+        description: '0 = coda completa, 1 = smoke test'
+        required: true
+        default: '0'
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: findmyink-cloud-collector
+  group: database-cloud-scraper
   cancel-in-progress: false
 
 jobs:
@@ -73,6 +78,7 @@ jobs:
       WORKER_INDEX: ${{ matrix.worker }}
       WORKER_COUNT: ${{ inputs.workers }}
       MAX_MINUTES: ${{ inputs.max_minutes }}
+      MAX_MUNICIPALITIES_PER_WORKER: ${{ inputs.max_municipalities_per_worker }}
       LEASE_SECONDS: '900'
       PREVIEW_INTERVAL_MS: '25000'
       OUTPUT_PATH: cloud-output/worker-${{ matrix.worker }}.json
