@@ -60,7 +60,8 @@ jobs:
           print(json.dumps({"action":"startCloudRun","runId":os.environ["RUN_ID"],"workerCount":int(os.environ["WORKER_COUNT"])}))
           PY
           )
-          response=$(curl --fail-with-body --silent --show-error --location --max-time 60 \
+          response=$(curl --fail-with-body --silent --show-error --location --max-time 75 \
+            --retry 6 --retry-all-errors --retry-delay 2 \
             -H 'Content-Type: text/plain;charset=utf-8' \
             --data-binary "$payload" \
             "$SHEET_ENDPOINT")
@@ -87,7 +88,8 @@ jobs:
       MAX_MINUTES: ${{ inputs.max_minutes }}
       MAX_MUNICIPALITIES_PER_WORKER: ${{ inputs.max_municipalities_per_worker }}
       LEASE_SECONDS: '900'
-      PREVIEW_INTERVAL_MS: '25000'
+      HEARTBEAT_INTERVAL_MS: '30000'
+      PREVIEW_INTERVAL_MS: '60000'
       OUTPUT_PATH: cloud-output/worker-${{ matrix.worker }}.json
       ELECTRON_DISABLE_SECURITY_WARNINGS: 'true'
     steps:
@@ -164,7 +166,8 @@ jobs:
           print(json.dumps({"action":"closeCloudRun","runId":os.environ["RUN_ID"],"workflowResult":os.environ.get("WORKFLOW_RESULT","")}))
           PY
           )
-          response=$(curl --fail-with-body --silent --show-error --location --max-time 60 \
+          response=$(curl --fail-with-body --silent --show-error --location --max-time 75 \
+            --retry 6 --retry-all-errors --retry-delay 2 \
             -H 'Content-Type: text/plain;charset=utf-8' \
             --data-binary "$payload" \
             "$SHEET_ENDPOINT")
