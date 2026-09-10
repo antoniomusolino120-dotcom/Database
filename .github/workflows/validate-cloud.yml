@@ -1,0 +1,61 @@
+name: Validate Cloud Collector
+
+on:
+  push:
+    branches: [collector-shared-queue-cloud]
+    paths:
+      - 'cloud/**'
+      - 'apps-script/Code.gs'
+      - '.github/workflows/cloud-collector.yml'
+      - '.github/workflows/validate-cloud.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Reconstruct verified V3.2 engine
+        shell: bash
+        run: |
+          BASE_COMMIT="edc8c985e9e2f6e9bc205e24889ff2169dd696cd"
+          git fetch --depth=1 origin "$BASE_COMMIT"
+          mkdir -p /tmp/fmi-v3-parts
+          for n in 00 01 02 03 04; do
+            git show "$BASE_COMMIT:.bootstrap/source.part${n}.b64" > "/tmp/fmi-v3-parts/source.part${n}.b64"
+          done
+          python3 - <<'PY'
+          import base64, pathlib
+          parts=[pathlib.Path(f'/tmp/fmi-v3-parts/source.part{i:02d}.b64').read_bytes() for i in range(5)]
+          if len(parts[3]) == 8999:
+              parts[3] = parts[3][:2408] + b'n' + parts[3][2408:]
+          pathlib.Path('source.zip').write_bytes(base64.b64decode(b''.join(parts), validate=True))
+          PY
+          echo "a98699a516c7f07cc553075d40d595691cced918c4cf71b90c53d8c450dd119c  source.zip" | sha256sum -c -
+          unzip -q source.zip
+          python3 .hotfix/patch_v32.py
+          cp -R cloud findmyink-collector/cloud
+
+      - name: Syntax checks
+        shell: bash
+        run: |
+          node --check findmyink-collector/cloud/worker.mjs
+          cp apps-script/Code.gs /tmp/findmyink-code.js
+          node --check /tmp/findmyink-code.js
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        working-directory: findmyink-collector
+        run: npm install
+
+      - name: Existing V3 tests
+        working-directory: findmyink-collector
+        run: npm test
