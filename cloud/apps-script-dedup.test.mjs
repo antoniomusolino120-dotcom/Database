@@ -4,9 +4,11 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import path from 'node:path';
 
+// In CI i test girano dentro findmyink-collector: il Code.gs autorevole è quello
+// del repository, non l'eventuale copia storica contenuta nello zip ricostruito.
 const candidates=[
-  path.resolve('apps-script/Code.gs'),
   path.resolve('..','apps-script','Code.gs'),
+  path.resolve('apps-script','Code.gs'),
 ];
 const codePath=candidates.find(p=>fs.existsSync(p));
 if(!codePath) throw new Error('apps-script/Code.gs non trovato');
