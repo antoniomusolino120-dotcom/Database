@@ -44,8 +44,14 @@ jobs:
         shell: bash
         run: |
           node --check findmyink-collector/cloud/worker.mjs
+          node --check findmyink-collector/cloud/finalizer.mjs
+          node --check findmyink-collector/cloud/dedup.mjs
           cp apps-script/Code.gs /tmp/findmyink-code.js
           node --check /tmp/findmyink-code.js
+
+      - name: Cloud dedup tests
+        working-directory: findmyink-collector
+        run: node --test cloud/dedup.test.mjs
 
       - name: Setup Node
         uses: actions/setup-node@v4
