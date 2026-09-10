@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FindMyInk Cloud Console</title>
+<style>
+:root{--bg:#0b0b0d;--panel:#141418;--panel2:#1a1a20;--line:#2b2b33;--text:#f5f5f6;--muted:#9797a3;--orange:#ff5000;--green:#34c759;--yellow:#ffcc00;--red:#ff453a}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+.wrap{max-width:1440px;margin:0 auto;padding:24px}.top{display:flex;gap:16px;align-items:center;justify-content:space-between;margin-bottom:18px}.brand{display:flex;align-items:center;gap:12px}.dot{width:14px;height:14px;border-radius:50%;background:var(--orange);box-shadow:0 0 20px rgba(255,80,0,.55)}
+h1{font-size:22px;margin:0}.sub{color:var(--muted);font-size:13px;margin-top:3px}.actions{display:flex;gap:8px}.btn{border:1px solid var(--line);background:var(--panel2);color:var(--text);padding:9px 12px;border-radius:10px;font-weight:700;cursor:pointer;text-decoration:none;font-size:13px}.btn.danger{border-color:#5a2020;color:#ff8d86}.btn:hover{filter:brightness(1.12)}
+.summary{display:grid;grid-template-columns:repeat(7,minmax(120px,1fr));gap:10px;margin-bottom:18px}.metric{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px}.metric b{display:block;font-size:22px;margin-top:5px}.metric span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+.progress{height:8px;background:#222229;border-radius:99px;overflow:hidden;margin:10px 0 18px}.progress>div{height:100%;width:0;background:linear-gradient(90deg,var(--orange),#ff8a4c);transition:width .4s}
+.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.worker{background:var(--panel);border:1px solid var(--line);border-radius:16px;overflow:hidden;min-width:0}.worker.off{opacity:.52}.worker-head{display:flex;align-items:center;justify-content:space-between;padding:13px 14px;border-bottom:1px solid var(--line)}.worker-title{font-weight:800}.badge{font-size:11px;font-weight:800;padding:5px 8px;border-radius:999px;background:#2a2a31;color:#cfcfd6}.badge.WORKING{background:rgba(52,199,89,.13);color:#75e18e}.badge.IDLE,.badge.QUEUED{background:rgba(255,204,0,.12);color:#ffe166}.badge.DONE{background:rgba(151,151,163,.16);color:#d1d1d7}.badge.ERROR{background:rgba(255,69,58,.13);color:#ff8c86}
+.preview{aspect-ratio:16/9;background:#09090b;display:grid;place-items:center;position:relative;overflow:hidden}.preview img{width:100%;height:100%;object-fit:cover;display:block}.placeholder{color:#54545f;font-size:12px}.preview-time{position:absolute;right:8px;bottom:8px;background:rgba(0,0,0,.7);padding:4px 6px;border-radius:6px;font-size:10px;color:#ddd}
+.body{padding:13px 14px}.municipality{font-size:17px;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.phase{font-size:12px;color:var(--orange);font-weight:800;margin-top:4px}.query{font-size:12px;color:var(--muted);margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-height:17px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:12px}.s{padding:8px;border:1px solid var(--line);border-radius:9px;background:#111115}.s span{display:block;color:var(--muted);font-size:9px;text-transform:uppercase}.s b{font-size:13px}.foot{display:flex;justify-content:space-between;color:var(--muted);font-size:10px;margin-top:10px}
+.log{margin-top:18px;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px}.log h2{font-size:13px;margin:0 0 10px}.rows{display:grid;gap:7px}.row{display:grid;grid-template-columns:70px 85px 1fr;gap:8px;font-size:11px;padding:7px 8px;background:#101014;border-radius:8px}.row .time,.row .who{color:var(--muted)}.error{color:#ff938d}.statusline{font-size:12px;color:var(--muted);margin-bottom:8px}
+@media(max-width:1100px){.summary{grid-template-columns:repeat(4,1fr)}.grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:720px){.wrap{padding:14px}.top{align-items:flex-start;flex-direction:column}.summary{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}.actions{width:100%;flex-wrap:wrap}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div class="brand"><div class="dot"></div><div><h1>FindMyInk Cloud Console</h1><div class="sub" id="runline">Nessun run attivo</div></div></div>
+    <div class="actions">
+      <a class="btn" href="https://github.com/antoniomusolino120-dotcom/Database/actions/workflows/cloud-collector.yml" target="_blank" rel="noopener">Avvia / GitHub Actions</a>
+      <button class="btn" onclick="refresh(true)">Aggiorna</button>
+      <button class="btn danger" onclick="stopRun()">STOP</button>
+    </div>
+  </div>
+  <div class="statusline" id="statusline">Connessione…</div>
+  <div class="summary">
+    <div class="metric"><span>Completati</span><b id="m-completed">—</b></div>
+    <div class="metric"><span>TODO</span><b id="m-todo">—</b></div>
+    <div class="metric"><span>Trovati</span><b id="m-found">—</b></div>
+    <div class="metric"><span>Nuovi</span><b id="m-new">—</b></div>
+    <div class="metric"><span>Duplicati</span><b id="m-dupes">—</b></div>
+    <div class="metric"><span>Scartati</span><b id="m-foreign">—</b></div>
+    <div class="metric"><span>Errori</span><b id="m-errors">—</b></div>
+  </div>
+  <div class="progress"><div id="bar"></div></div>
+  <div class="grid" id="workers"></div>
+  <div class="log"><h2>Attività worker</h2><div class="rows" id="activity"></div></div>
+</div>
+<script>
+const previewTimes={}; const previewImages={}; let timer=null;
+function esc(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+function fmt(n){return Number(n||0).toLocaleString('it-IT')}
+function time(v){if(!v)return '—';const d=new Date(v);return isNaN(d)?'—':d.toLocaleTimeString('it-IT',{hour:'2-digit',minute:'2-digit',second:'2-digit'});}
+function render(data){
+  const run=data.run||{},t=data.totals||{},workers=data.workers||[];
+  document.getElementById('runline').textContent=run.runId?`Run ${run.runId} · ${run.workerCount||0} worker · ${run.status||'—'}`:'Nessun run attivo';
+  document.getElementById('statusline').textContent=`Ultimo aggiornamento ${time(data.generatedAt)} · Dashboard aggiornata automaticamente`;
+  document.getElementById('m-completed').textContent=`${fmt(t.completed)} / ${fmt(t.total)}`;
+  document.getElementById('m-todo').textContent=fmt(t.todo);document.getElementById('m-found').textContent=fmt(t.found);
+  document.getElementById('m-new').textContent=fmt(t.newCount);document.getElementById('m-dupes').textContent=fmt(t.duplicates);
+  document.getElementById('m-foreign').textContent=fmt(t.foreign);document.getElementById('m-errors').textContent=fmt(t.errors);
+  document.getElementById('bar').style.width=(t.total?Math.min(100,(t.completed/t.total)*100):0)+'%';
+  for(const w of workers){
+    const i=Number(w.workerIndex||0);
+    if(w.previewAt){previewTimes[i]=w.previewAt;if(w.previewBase64)previewImages[i]='data:image/jpeg;base64,'+w.previewBase64;}
+  }
+  document.getElementById('workers').innerHTML=workers.map(w=>{
+    const i=Number(w.workerIndex||0),st=String(w.status||'OFFLINE'),active=i<Number(run.workerCount||0);
+    const img=previewImages[i]?`<img src="${previewImages[i]}" alt="Preview Chromium worker ${i+1}">`:`<div class="placeholder">Preview Chromium non ancora disponibile</div>`;
+    const cur=w.municipalityName||'—',q=w.query||'',phase=w.phase||st;
+    return `<section class="worker ${active?'':'off'}"><div class="worker-head"><div class="worker-title">Worker ${i+1}</div><span class="badge ${esc(st)}">${esc(st)}</span></div>
+      <div class="preview">${img}<span class="preview-time">${esc(time(w.previewAt))}</span></div>
+      <div class="body"><div class="municipality">${esc(cur)}</div><div class="phase">${esc(phase)}</div><div class="query">${esc(q)}</div>
+      <div class="stats"><div class="s"><span>Trovati</span><b>${fmt(w.found||0)}</b></div><div class="s"><span>Nuovi</span><b>${fmt(w.newCount||0)}</b></div><div class="s"><span>Dup.</span><b>${fmt(w.duplicates||0)}</b></div><div class="s"><span>Comuni</span><b>${fmt(w.completedMunicipalities||0)}</b></div></div>
+      <div class="foot"><span>${esc(w.queueCode||'')}</span><span>ping ${esc(time(w.lastSeen))}</span></div></div></section>`;
+  }).join('');
+  const rows=workers.filter(w=>Number(w.workerIndex)<Number(run.workerCount||0)).map(w=>{
+    const msg=w.lastError?`<span class="error">${esc(w.lastError)}</span>`:esc(`${w.phase||w.status||''}${w.municipalityName?' · '+w.municipalityName:''}${w.query?' · '+w.query:''}`);
+    return `<div class="row"><span class="time">${esc(time(w.lastSeen))}</span><span class="who">Worker ${Number(w.workerIndex)+1}</span><span>${msg}</span></div>`;
+  });
+  document.getElementById('activity').innerHTML=rows.join('')||'<div class="row"><span>—</span><span>—</span><span>Nessuna attività</span></div>';
+}
+function refresh(force){
+  if(force)document.getElementById('statusline').textContent='Aggiornamento…';
+  google.script.run.withSuccessHandler(render).withFailureHandler(err=>{
+    document.getElementById('statusline').textContent='Errore dashboard: '+(err&&err.message?err.message:err);
+  }).getCloudDashboardState(previewTimes);
+}
+function stopRun(){
+  if(!confirm('Richiedere lo stop del run cloud? I worker termineranno in sicurezza appena possibile.'))return;
+  google.script.run.withSuccessHandler(()=>refresh(true)).requestCloudStop();
+}
+refresh(true);timer=setInterval(()=>refresh(false),5000);
+</script>
+</body>
+</html>
