@@ -1,0 +1,98 @@
+name: FindMyInk Cloud Collector
+
+on:
+  workflow_dispatch:
+    inputs:
+      workers:
+        description: 'Browser paralleli'
+        required: true
+        default: '3'
+        type: choice
+        options: ['3','5']
+      max_minutes:
+        description: 'Durata massima per worker (max 330)'
+        required: true
+        default: '300'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: findmyink-cloud-collector
+  cancel-in-progress: false
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      workers: ${{ steps.matrix.outputs.workers }}
+    steps:
+      - id: matrix
+        shell: bash
+        run: |
+          if [ "${{ inputs.workers }}" = "5" ]; then
+            echo 'workers={"worker":[0,1,2,3,4]}' >> "$GITHUB_OUTPUT"
+          else
+            echo 'workers={"worker":[0,1,2]}' >> "$GITHUB_OUTPUT"
+          fi
+
+  worker:
+    needs: matrix
+    timeout-minutes: 355
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.workers) }}
+    env:
+      SHEET_ENDPOINT: ${{ secrets.SHEET_ENDPOINT }}
+      WORKER_INDEX: ${{ matrix.worker }}
+      WORKER_COUNT: ${{ inputs.workers }}
+      MAX_MINUTES: ${{ inputs.max_minutes }}
+      WORK_BATCH_SIZE: '8'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Require Sheet bridge
+        shell: bash
+        run: test -n "$SHEET_ENDPOINT" || (echo 'Missing repository secret SHEET_ENDPOINT' && exit 1)
+
+      - name: Reconstruct verified V3.2 engine
+        shell: bash
+        run: |
+          BASE_COMMIT="edc8c985e9e2f6e9bc205e24889ff2169dd696cd"
+          git fetch --depth=1 origin "$BASE_COMMIT"
+          mkdir -p /tmp/fmi-v3-parts
+          for n in 00 01 02 03 04; do
+            git show "$BASE_COMMIT:.bootstrap/source.part${n}.b64" > "/tmp/fmi-v3-parts/source.part${n}.b64"
+          done
+          python3 - <<'PY'
+          import base64, pathlib
+          parts=[pathlib.Path(f'/tmp/fmi-v3-parts/source.part{i:02d}.b64').read_bytes() for i in range(5)]
+          if len(parts[3]) == 8999:
+              parts[3] = parts[3][:2408] + b'n' + parts[3][2408:]
+          pathlib.Path('source.zip').write_bytes(base64.b64decode(b''.join(parts), validate=True))
+          PY
+          echo "a98699a516c7f07cc553075d40d595691cced918c4cf71b90c53d8c450dd119c  source.zip" | sha256sum -c -
+          unzip -q source.zip
+          python3 .hotfix/patch_v32.py
+          cp -R cloud findmyink-collector/cloud
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Electron dependencies
+        working-directory: findmyink-collector
+        run: npm install
+
+      - name: Run tests
+        working-directory: findmyink-collector
+        run: npm test
+
+      - name: Run cloud shard
+        working-directory: findmyink-collector
+        shell: bash
+        run: xvfb-run -a npx electron cloud/worker.mjs
