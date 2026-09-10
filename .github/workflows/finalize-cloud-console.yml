@@ -1,0 +1,128 @@
+name: Finalize cloud console backend
+
+on:
+  push:
+    branches: [collector-shared-queue-cloud]
+    paths:
+      - '.github/workflows/finalize-cloud-console.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: collector-shared-queue-cloud
+          fetch-depth: 0
+
+      - name: Patch Apps Script backend and worker
+        shell: python
+        run: |
+          from pathlib import Path
+
+          p=Path('apps-script/Code.gs')
+          s=p.read_text()
+          anchor="const CLOUD_DEFAULT_LEASE_SECONDS = 900;\n"
+          addition="""const CLOUD_DEFAULT_LEASE_SECONDS = 900;
+          const CLOUD_PENDING_START_KEY = 'CLOUD_PENDING_START';
+          const GITHUB_OWNER = 'antoniomusolino120-dotcom';
+          const GITHUB_REPO = 'Database';
+          const GITHUB_WORKFLOW = 'cloud-collector.yml';
+          const GITHUB_REF = 'main';
+          """
+          if 'const GITHUB_WORKFLOW' not in s:
+              assert anchor in s
+              s=s.replace(anchor,addition,1)
+
+          old="const patch={};patch[CLOUD_RUN_KEY]=state;"
+          new="const patch={};patch[CLOUD_RUN_KEY]=state;patch[CLOUD_PENDING_START_KEY]='';"
+          if old in s:
+              s=s.replace(old,new,1)
+
+          old="const summary={run,workers,totals:run.totals||computeCloudTotals_(),generatedAt:nowIso_()};"
+          new="const pendingStart=getJobStateValue_(CLOUD_PENDING_START_KEY);const summary={run,workers,totals:run.totals||computeCloudTotals_(),pendingStart,console:{githubConfigured:Boolean(githubToken_())},generatedAt:nowIso_()};"
+          if old in s:
+              s=s.replace(old,new,1)
+
+          old="run.status=run.stopRequested?'STOPPED':(errors?'COMPLETED_WITH_ERRORS':'COMPLETED');"
+          if old in s:
+              s=s.replace(old,"run.status=run.stopRequested?'STOPPED':'WORKERS_DONE';",1)
+
+          marker='function doGet(e){\n'
+          if 'function startCloudCollector(' not in s:
+              assert marker in s
+              funcs=r'''function githubToken_(){
+            return String(PropertiesService.getScriptProperties().getProperty('GITHUB_TOKEN')||'').trim();
+          }
+
+          function githubDispatch_(workerCount,maxMunicipalitiesPerWorker,maxMinutes){
+            const token=githubToken_();
+            if(!token)throw new Error('GITHUB_TOKEN non configurato nelle Proprietà script');
+            const url='https://api.github.com/repos/'+encodeURIComponent(GITHUB_OWNER)+'/'+encodeURIComponent(GITHUB_REPO)+'/actions/workflows/'+encodeURIComponent(GITHUB_WORKFLOW)+'/dispatches';
+            const payload={ref:GITHUB_REF,inputs:{workers:String(workerCount),max_minutes:String(maxMinutes),max_municipalities_per_worker:String(maxMunicipalitiesPerWorker)}};
+            const res=UrlFetchApp.fetch(url,{
+              method:'post',contentType:'application/json',
+              headers:{Authorization:'Bearer '+token,Accept:'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'},
+              payload:JSON.stringify(payload),muteHttpExceptions:true
+            });
+            const code=res.getResponseCode(),body=String(res.getContentText()||'');
+            if(code<200||code>=300)throw new Error('GitHub workflow dispatch HTTP '+code+(body?' · '+body.slice(0,350):''));
+            let parsed={};if(body){try{parsed=JSON.parse(body);}catch{parsed={};}}
+            return {statusCode:code,workflowRunId:parsed.workflow_run_id||null,workflowRunUrl:parsed.html_url||null};
+          }
+
+          function startCloudCollector(workerCount,maxMunicipalitiesPerWorker,maxMinutes){
+            workerCount=Number(workerCount);
+            maxMunicipalitiesPerWorker=Math.max(0,Math.min(10000,Number(maxMunicipalitiesPerWorker)||0));
+            maxMinutes=Math.max(5,Math.min(330,Number(maxMinutes)||300));
+            if(![3,5].includes(workerCount))throw new Error('Scegli 3 o 5 Chromium');
+            if(!githubToken_())throw new Error('GITHUB_TOKEN non configurato nelle Proprietà script');
+            const lock=LockService.getScriptLock();lock.waitLock(10000);let pending;
+            try{
+              const run=getJobStateValue_(CLOUD_RUN_KEY);
+              if(run&&['RUNNING','STOPPING','WORKERS_DONE'].includes(String(run.status||'')))throw new Error('Esiste già un run attivo: '+String(run.status||''));
+              const currentPending=getJobStateValue_(CLOUD_PENDING_START_KEY);
+              if(currentPending&&currentPending.requestedAt){const age=Date.now()-(Date.parse(currentPending.requestedAt)||0);if(age>=0&&age<90000)throw new Error('Avvio già richiesto, attendi che GitHub prepari i worker');}
+              pending={requestedAt:nowIso_(),workerCount,maxMunicipalitiesPerWorker,maxMinutes};
+              const patch={};patch[CLOUD_PENDING_START_KEY]=pending;setJobState_(patch);clearDashboardCache_();
+            }finally{lock.releaseLock();}
+            try{return {ok:true,pendingStart:pending,...githubDispatch_(workerCount,maxMunicipalitiesPerWorker,maxMinutes)};}
+            catch(err){const patch={};patch[CLOUD_PENDING_START_KEY]='';setJobState_(patch);clearDashboardCache_();throw err;}
+          }
+
+          '''
+              s=s.replace(marker,funcs+marker,1)
+          p.write_text(s)
+
+          p=Path('cloud/worker.mjs')
+          s=p.read_text()
+          anchor="const LEASE_SECONDS=Math.max(300,Math.min(1800,Number(process.env.LEASE_SECONDS||900)));\n"
+          if 'MAX_MUNICIPALITIES_PER_WORKER' not in s:
+              assert anchor in s
+              s=s.replace(anchor,anchor+"const MAX_MUNICIPALITIES_PER_WORKER=Math.max(0,Math.min(10000,Number(process.env.MAX_MUNICIPALITIES_PER_WORKER||0)));\n",1)
+          s=s.replace("let lastHeartbeat=0,lastPreview=0,stopRequested=false;","let lastHeartbeat=0,lastPreview=0,stopRequested=false,completedByWorker=0;",1)
+          s=s.replace("while(Date.now()<deadline&&!stopRequested){","while(Date.now()<deadline&&!stopRequested&&(MAX_MUNICIPALITIES_PER_WORKER===0||completedByWorker<MAX_MUNICIPALITIES_PER_WORKER)){",1)
+          needle="        municipalitiesSinceRefresh++;\n"
+          if "completedByWorker++;" not in s:
+              assert needle in s
+              s=s.replace(needle,needle+"        completedByWorker++;\n",1)
+          s=s.replace("log('worker-done',{municipalities:state.municipalities.length,errors:state.errors.length,stopped:stopRequested});","log('worker-done',{municipalities:state.municipalities.length,completedByWorker,limit:MAX_MUNICIPALITIES_PER_WORKER,errors:state.errors.length,stopped:stopRequested});",1)
+          p.write_text(s)
+
+          p=Path('.github/workflows/validate-cloud.yml')
+          s=p.read_text()
+          if "      - 'apps-script/dashboard.html'" not in s:
+              s=s.replace("      - 'apps-script/Code.gs'\n","      - 'apps-script/Code.gs'\n      - 'apps-script/dashboard.html'\n",1)
+          p.write_text(s)
+
+      - name: Commit
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add apps-script/Code.gs cloud/worker.mjs .github/workflows/validate-cloud.yml
+          git commit -m "cloud: wire console launch and smoke mode"
+          git push origin HEAD:collector-shared-queue-cloud
