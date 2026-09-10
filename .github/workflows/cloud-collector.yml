@@ -9,11 +9,6 @@ on:
         default: '3'
         type: choice
         options: ['3','5']
-      municipalities_per_worker:
-        description: 'Comuni massimi per worker (0 = fino al limite temporale)'
-        required: true
-        default: '1'
-        type: string
       max_minutes:
         description: 'Durata massima per worker (max 330)'
         required: true
@@ -54,8 +49,8 @@ jobs:
       WORKER_INDEX: ${{ matrix.worker }}
       WORKER_COUNT: ${{ inputs.workers }}
       MAX_MINUTES: ${{ inputs.max_minutes }}
-      MAX_MUNICIPALITIES: ${{ inputs.municipalities_per_worker }}
       WORK_BATCH_SIZE: '8'
+      OUTPUT_PATH: cloud-output/worker-${{ matrix.worker }}.json
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -102,3 +97,44 @@ jobs:
         working-directory: findmyink-collector
         shell: bash
         run: xvfb-run -a npx electron cloud/worker.mjs
+
+      - name: Upload shard candidates
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-shard-${{ matrix.worker }}
+          path: findmyink-collector/cloud-output/worker-${{ matrix.worker }}.json
+          if-no-files-found: warn
+          retention-days: 1
+
+  finalize:
+    needs: [matrix, worker]
+    if: ${{ always() && needs.matrix.result == 'success' }}
+    timeout-minutes: 45
+    runs-on: ubuntu-latest
+    env:
+      SHEET_ENDPOINT: ${{ secrets.SHEET_ENDPOINT }}
+      ARTIFACT_ROOT: cloud-artifacts
+      FINAL_BATCH_SIZE: '50'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Require Sheet bridge
+        shell: bash
+        run: test -n "$SHEET_ENDPOINT" || (echo 'Missing repository secret SHEET_ENDPOINT' && exit 1)
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Download all shard candidates
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cloud-shard-*
+          path: cloud-artifacts
+          merge-multiple: true
+
+      - name: Run single final dedup and commit
+        run: node cloud/finalizer.mjs
