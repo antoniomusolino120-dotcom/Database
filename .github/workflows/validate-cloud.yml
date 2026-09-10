@@ -52,7 +52,7 @@ jobs:
 
       - name: Cloud dedup tests
         working-directory: findmyink-collector
-        run: node --test cloud/dedup.test.mjs
+        run: node --test cloud/dedup.test.mjs cloud/apps-script-dedup.test.mjs
 
       - name: Setup Node
         uses: actions/setup-node@v4
