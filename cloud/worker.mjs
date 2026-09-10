@@ -16,7 +16,8 @@ const WORKER_INDEX=Number(process.env.WORKER_INDEX||0);
 const WORKER_COUNT=Number(process.env.WORKER_COUNT||3);
 const MAX_MINUTES=Math.min(330,Math.max(5,Number(process.env.MAX_MINUTES||300)));
 const OUTPUT_PATH=String(process.env.OUTPUT_PATH||path.join('cloud-output',`worker-${WORKER_INDEX}.json`));
-const PREVIEW_INTERVAL_MS=Math.max(15000,Number(process.env.PREVIEW_INTERVAL_MS||25000));
+const PREVIEW_INTERVAL_MS=Math.max(30000,Number(process.env.PREVIEW_INTERVAL_MS||60000));
+const HEARTBEAT_INTERVAL_MS=Math.max(15000,Number(process.env.HEARTBEAT_INTERVAL_MS||30000));
 const LEASE_SECONDS=Math.max(300,Math.min(1800,Number(process.env.LEASE_SECONDS||900)));
 const MAX_MUNICIPALITIES_PER_WORKER=Math.max(0,Math.min(10000,Number(process.env.MAX_MUNICIPALITIES_PER_WORKER||0)));
 const QUERIES=String(process.env.MAPS_QUERIES||'tattoo,tatuatore,tattoo studio,studio tatuaggi,tattoo artist').split(',').map(x=>x.trim()).filter(Boolean);
@@ -29,17 +30,19 @@ const SETTINGS={
   maxScrollsPerQuery:Number(process.env.MAX_SCROLLS_PER_QUERY||60),
 };
 
-const state={version:3,runId:RUN_ID,workerIndex:WORKER_INDEX,workerCount:WORKER_COUNT,startedAt:new Date().toISOString(),finishedAt:null,municipalities:[],errors:[]};
+const state={version:4,runId:RUN_ID,workerIndex:WORKER_INDEX,workerCount:WORKER_COUNT,startedAt:new Date().toISOString(),finishedAt:null,municipalities:[],errors:[]};
 const log=(event,meta={})=>console.log(JSON.stringify({ts:new Date().toISOString(),runId:RUN_ID,worker:WORKER_INDEX,event,...meta}));
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 let lastHeartbeat=0,lastPreview=0,stopRequested=false,completedByWorker=0;
 
 async function persist(){await fs.mkdir(path.dirname(OUTPUT_PATH),{recursive:true});await fs.writeFile(OUTPUT_PATH,JSON.stringify(state,null,2));}
-async function sheet(action,payload={},attempts=4){
+
+async function sheet(action,payload={},attempts=6){
   if(!ENDPOINT)throw new Error('SHEET_ENDPOINT non configurato nei GitHub Actions secrets');
   let last;
   for(let i=1;i<=attempts;i++){
-    const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),45000);
+    const controller=new AbortController();
+    const timer=setTimeout(()=>controller.abort(),60000);
     try{
       const res=await fetch(ENDPOINT,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({action,...payload}),redirect:'follow',signal:controller.signal});
       if(!res.ok)throw new Error(`Sheet bridge HTTP ${res.status}`);
@@ -47,8 +50,14 @@ async function sheet(action,payload={},attempts=4){
       try{data=JSON.parse(text);}catch{throw new Error(`Risposta Sheet non JSON: ${text.slice(0,160)}`);}
       if(!data.ok)throw new Error(data.error||`Azione ${action} fallita`);
       return data;
-    }catch(err){last=err;if(i<attempts)await sleep(700*i);}
-    finally{clearTimeout(timer);}
+    }catch(err){
+      last=err;
+      if(i<attempts){
+        const delay=Math.min(12000,900*(2**(i-1)))+Math.floor(Math.random()*500);
+        log('sheet-retry',{action,attempt:i,error:err?.message||String(err),delayMs:delay});
+        await sleep(delay);
+      }
+    }finally{clearTimeout(timer);}
   }
   throw last;
 }
@@ -61,10 +70,11 @@ function normalizeMapsUrl(url=''){
 function isTattoo(item){const hay=`${item?.name||''} ${item?.address||''} ${item?.website||''}`.toLowerCase();return /tattoo|tatu|tatou|ink/.test(hay);}
 
 async function heartbeat(extra={},force=false){
-  if(!force&&Date.now()-lastHeartbeat<12000)return !stopRequested;
+  const age=Date.now()-lastHeartbeat;
+  if((!force&&age<HEARTBEAT_INTERVAL_MS)||(force&&age<5000))return !stopRequested;
   lastHeartbeat=Date.now();
   try{
-    const r=await sheet('heartbeatCloudWorker',{runId:RUN_ID,workerIndex:WORKER_INDEX,leaseSeconds:LEASE_SECONDS,state:extra},2);
+    const r=await sheet('heartbeatCloudWorker',{runId:RUN_ID,workerIndex:WORKER_INDEX,leaseSeconds:LEASE_SECONDS,state:extra},3);
     stopRequested=Boolean(r.stopRequested);
   }catch(err){log('heartbeat-error',{error:err.message});}
   return !stopRequested;
@@ -86,11 +96,16 @@ async function preview(browser,force=false){
 }
 
 async function refreshKnownIndex(knownKeys,knownUrls){
-  const index=await sheet('getCloudDedupIndex');
+  const index=await sheet('getCloudDedupIndex',{},6);
   knownKeys.clear();knownUrls.clear();
   for(const key of index.mapsKeys||[])if(key)knownKeys.add(String(key));
   for(const url of index.mapsUrls||[])if(url)knownUrls.add(normalizeMapsUrl(url));
   log('dedup-index-loaded',{keys:knownKeys.size,urls:knownUrls.size});
+}
+
+async function finishWorker(){
+  try{return await sheet('finishCloudWorker',{runId:RUN_ID,workerIndex:WORKER_INDEX},6);}
+  catch(err){log('finish-worker-error',{error:err?.message||String(err)});return null;}
 }
 
 async function run(){
@@ -110,10 +125,16 @@ async function run(){
     await preview(browser,true);
 
     while(Date.now()<deadline&&!stopRequested&&(MAX_MUNICIPALITIES_PER_WORKER===0||completedByWorker<MAX_MUNICIPALITIES_PER_WORKER)){
-      const claim=await sheet('claimCloudMunicipality',{runId:RUN_ID,workerIndex:WORKER_INDEX,leaseSeconds:LEASE_SECONDS});
+      const claim=await sheet('claimCloudMunicipality',{runId:RUN_ID,workerIndex:WORKER_INDEX,leaseSeconds:LEASE_SECONDS},6);
       if(claim.stopped){stopRequested=true;break;}
+      if(claim.retry){
+        const wait=Math.max(1500,Math.min(15000,Number(claim.retryAfterMs)||5000));
+        log('queue-busy',{retryAfterMs:wait,eligibleTodo:Number(claim.eligibleTodo)||0});
+        await sleep(wait);
+        continue;
+      }
       const municipality=claim.row;
-      if(!municipality){log('queue-empty');break;}
+      if(!municipality){log('queue-empty',{queueExhausted:Boolean(claim.queueExhausted)});break;}
 
       if(municipalitiesSinceRefresh>=5){
         await refreshKnownIndex(knownKeys,knownUrls);
@@ -122,7 +143,7 @@ async function run(){
 
       let found=0,preDuplicates=0,foreign=0;
       const candidates=[],seenThisMunicipality=new Set();
-      log('municipality-start',{queueCode:municipality.queueCode,municipalityId:municipality.municipalityId,name:municipality.name});
+      log('municipality-start',{queueCode:municipality.queueCode,municipalityId:municipality.municipalityId,name:municipality.name,claimToken:municipality.claimToken});
       await heartbeat({status:'WORKING',municipalityId:String(municipality.municipalityId),municipalityName:municipality.name,queueCode:municipality.queueCode,phase:'AVVIO COMUNE',query:'',found:0,newCount:0,duplicates:0,foreign:0},true);
 
       try{
@@ -148,7 +169,10 @@ async function run(){
             }
             if(fingerprint)seenThisMunicipality.add(fingerprint);
 
-            if(ri%5===0)await heartbeat({status:'WORKING',phase:'APERTURA SCHEDE',query,found,newCount:candidates.length,duplicates:preDuplicates,foreign});
+            if(ri%8===0){
+              const alive=await heartbeat({status:'WORKING',phase:'APERTURA SCHEDE',query,found,newCount:candidates.length,duplicates:preDuplicates,foreign});
+              if(!alive)throw new Error('__STOP__');
+            }
             const candidate=await browser.extractPlace(link,SETTINGS);
             await preview(browser);
             if(candidate.verification)throw new Error('GOOGLE_VERIFICATION_REQUIRED');
@@ -160,11 +184,19 @@ async function run(){
           }
         }
 
-        await heartbeat({status:'WORKING',phase:'DEDUPLICA FINALE',query:'',found,newCount:candidates.length,duplicates:preDuplicates,foreign},true);
+        if(!(await heartbeat({status:'WORKING',phase:'DEDUPLICA FINALE',query:'',found,newCount:candidates.length,duplicates:preDuplicates,foreign},true)))throw new Error('__STOP__');
         const finalized=await sheet('finalizeCloudMunicipality',{
-          runId:RUN_ID,workerIndex:WORKER_INDEX,municipalityId:String(municipality.municipalityId),
-          foundCount:found,preDuplicateCount:preDuplicates,foreignCount:foreign,candidates,completedAt:new Date().toISOString()
-        });
+          runId:RUN_ID,
+          workerIndex:WORKER_INDEX,
+          municipalityId:String(municipality.municipalityId),
+          claimToken:String(municipality.claimToken||''),
+          claimSheetRow:Number(municipality.sheetRow)||0,
+          foundCount:found,
+          preDuplicateCount:preDuplicates,
+          foreignCount:foreign,
+          candidates,
+          completedAt:new Date().toISOString()
+        },6);
         municipalitiesSinceRefresh++;
         completedByWorker++;
         for(const item of finalized.items||[]){
@@ -173,18 +205,28 @@ async function run(){
         }
         state.municipalities.push({
           queueCode:municipality.queueCode,municipalityId:String(municipality.municipalityId),name:municipality.name,
-          foundCount:found,newCount:Number(finalized.inserted)||0,duplicateCount:Number(finalized.duplicates)||0,foreignCount:foreign,completedAt:finalized.completedAt
+          foundCount:found,newCount:Number(finalized.inserted)||0,duplicateCount:Number(finalized.duplicates)||0,foreignCount:foreign,completedAt:finalized.completedAt,
+          replayed:Boolean(finalized.alreadyFinalized)
         });
         await persist();
-        log('municipality-complete',{queueCode:municipality.queueCode,found,newCount:finalized.inserted,duplicates:finalized.duplicates,foreign});
+        log('municipality-complete',{queueCode:municipality.queueCode,found,newCount:finalized.inserted,duplicates:finalized.duplicates,foreign,replayed:Boolean(finalized.alreadyFinalized)});
         await heartbeat({status:'IDLE',phase:'COMUNE COMPLETATO',query:'',found,newCount:Number(finalized.inserted)||0,duplicates:Number(finalized.duplicates)||0,foreign},true);
       }catch(err){
-        const code=err.message;
+        const code=err?.message||String(err);
         if(code==='__STOP__'||code==='__TIME_LIMIT__'){
           log(code==='__STOP__'?'stop-requested':'time-limit',{queueCode:municipality.queueCode});
           break;
         }
-        await sheet('failCloudMunicipality',{runId:RUN_ID,workerIndex:WORKER_INDEX,municipalityId:String(municipality.municipalityId),error:code}).catch(()=>{});
+        try{
+          await sheet('failCloudMunicipality',{
+            runId:RUN_ID,
+            workerIndex:WORKER_INDEX,
+            municipalityId:String(municipality.municipalityId),
+            claimToken:String(municipality.claimToken||''),
+            claimSheetRow:Number(municipality.sheetRow)||0,
+            error:code
+          },4);
+        }catch(failErr){log('fail-report-error',{queueCode:municipality.queueCode,error:failErr?.message||String(failErr)});}
         state.errors.push({queueCode:municipality.queueCode,municipalityId:String(municipality.municipalityId),error:code});
         await persist();
         log('municipality-error',{queueCode:municipality.queueCode,error:code});
@@ -195,13 +237,14 @@ async function run(){
     await preview(browser,true).catch(()=>{});
     await browser.close().catch(()=>{});
     state.finishedAt=new Date().toISOString();await persist();
-    await sheet('finishCloudWorker',{runId:RUN_ID,workerIndex:WORKER_INDEX}).catch(()=>{});
+    await finishWorker();
     log('worker-done',{municipalities:state.municipalities.length,completedByWorker,limit:MAX_MUNICIPALITIES_PER_WORKER,errors:state.errors.length,stopped:stopRequested});
   }
 }
 
 run().then(()=>app.quit()).catch(async err=>{
   state.errors.push({municipalityId:'',error:err?.message||String(err)});state.finishedAt=new Date().toISOString();
-  await persist().catch(()=>{});await sheet('finishCloudWorker',{runId:RUN_ID,workerIndex:WORKER_INDEX}).catch(()=>{});
+  await persist().catch(()=>{});
+  await finishWorker();
   console.error(err?.stack||err);app.exit(1);
 });
