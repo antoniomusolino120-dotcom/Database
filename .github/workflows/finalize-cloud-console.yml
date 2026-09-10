@@ -112,17 +112,11 @@ jobs:
           s=s.replace("log('worker-done',{municipalities:state.municipalities.length,errors:state.errors.length,stopped:stopRequested});","log('worker-done',{municipalities:state.municipalities.length,completedByWorker,limit:MAX_MUNICIPALITIES_PER_WORKER,errors:state.errors.length,stopped:stopRequested});",1)
           p.write_text(s)
 
-          p=Path('.github/workflows/validate-cloud.yml')
-          s=p.read_text()
-          if "      - 'apps-script/dashboard.html'" not in s:
-              s=s.replace("      - 'apps-script/Code.gs'\n","      - 'apps-script/Code.gs'\n      - 'apps-script/dashboard.html'\n",1)
-          p.write_text(s)
-
       - name: Commit
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add apps-script/Code.gs cloud/worker.mjs .github/workflows/validate-cloud.yml
+          git add apps-script/Code.gs cloud/worker.mjs
           git commit -m "cloud: wire console launch and smoke mode"
           git push origin HEAD:collector-shared-queue-cloud
