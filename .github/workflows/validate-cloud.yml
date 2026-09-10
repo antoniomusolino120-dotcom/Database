@@ -9,6 +9,14 @@ on:
       - 'apps-script/dashboard.html'
       - '.github/workflows/cloud-collector.yml'
       - '.github/workflows/validate-cloud.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'cloud/**'
+      - 'apps-script/Code.gs'
+      - 'apps-script/dashboard.html'
+      - '.github/workflows/cloud-collector.yml'
+      - '.github/workflows/validate-cloud.yml'
 
 permissions:
   contents: read
