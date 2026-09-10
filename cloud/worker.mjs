@@ -33,7 +33,7 @@ const SETTINGS={
 const state={version:4,runId:RUN_ID,workerIndex:WORKER_INDEX,workerCount:WORKER_COUNT,startedAt:new Date().toISOString(),finishedAt:null,municipalities:[],errors:[]};
 const log=(event,meta={})=>console.log(JSON.stringify({ts:new Date().toISOString(),runId:RUN_ID,worker:WORKER_INDEX,event,...meta}));
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-let lastHeartbeat=0,lastPreview=0,stopRequested=false,completedByWorker=0;
+let lastHeartbeat=0,lastPreview=0,stopRequested=false,completedByWorker=0,ambiguousClaimCount=0;
 
 async function persist(){await fs.mkdir(path.dirname(OUTPUT_PATH),{recursive:true});await fs.writeFile(OUTPUT_PATH,JSON.stringify(state,null,2));}
 
@@ -128,13 +128,27 @@ async function run(){
       const claim=await sheet('claimCloudMunicipality',{runId:RUN_ID,workerIndex:WORKER_INDEX,leaseSeconds:LEASE_SECONDS},6);
       if(claim.stopped){stopRequested=true;break;}
       if(claim.retry){
+        ambiguousClaimCount=0;
         const wait=Math.max(1500,Math.min(15000,Number(claim.retryAfterMs)||5000));
         log('queue-busy',{retryAfterMs:wait,eligibleTodo:Number(claim.eligibleTodo)||0});
         await sleep(wait);
         continue;
       }
       const municipality=claim.row;
-      if(!municipality){log('queue-empty',{queueExhausted:Boolean(claim.queueExhausted)});break;}
+      if(!municipality){
+        if(claim.queueExhausted===true){
+          ambiguousClaimCount=0;
+          log('queue-empty',{queueExhausted:true});
+          break;
+        }
+        ambiguousClaimCount++;
+        const wait=Math.min(15000,1500+ambiguousClaimCount*1000);
+        log('queue-ambiguous',{queueExhausted:false,attempt:ambiguousClaimCount,retryAfterMs:wait});
+        if(ambiguousClaimCount>=12)throw new Error('CLAIM_AMBIGUOUS_RETRY_EXHAUSTED');
+        await sleep(wait);
+        continue;
+      }
+      ambiguousClaimCount=0;
 
       if(municipalitiesSinceRefresh>=5){
         await refreshKnownIndex(knownKeys,knownUrls);
