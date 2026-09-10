@@ -53,14 +53,21 @@ jobs:
       - name: Start central queue
         shell: bash
         run: |
+          set -euo pipefail
           test -n "$SHEET_ENDPOINT" || (echo 'Missing repository secret SHEET_ENDPOINT' && exit 1)
-          python3 - <<'PY'
-          import json, os, urllib.request
-          body=json.dumps({"action":"startCloudRun","runId":os.environ["RUN_ID"],"workerCount":int(os.environ["WORKER_COUNT"])}).encode()
-          req=urllib.request.Request(os.environ["SHEET_ENDPOINT"],data=body,headers={"Content-Type":"text/plain;charset=utf-8"})
-          with urllib.request.urlopen(req,timeout=45) as r:
-              data=json.loads(r.read().decode())
-          if not data.get("ok"):
+          payload=$(python3 - <<'PY'
+          import json, os
+          print(json.dumps({"action":"startCloudRun","runId":os.environ["RUN_ID"],"workerCount":int(os.environ["WORKER_COUNT"])}))
+          PY
+          )
+          response=$(curl --fail-with-body --silent --show-error --location --max-time 60 \
+            -H 'Content-Type: text/plain;charset=utf-8' \
+            --data-binary "$payload" \
+            "$SHEET_ENDPOINT")
+          RESPONSE="$response" python3 - <<'PY'
+          import json, os
+          data=json.loads(os.environ['RESPONSE'])
+          if not data.get('ok'):
               raise SystemExit(data)
           print(data)
           PY
@@ -150,13 +157,20 @@ jobs:
       - name: Close run state
         shell: bash
         run: |
-          python3 - <<'PY'
-          import json, os, urllib.request
-          body=json.dumps({"action":"closeCloudRun","runId":os.environ["RUN_ID"],"workflowResult":os.environ.get("WORKFLOW_RESULT","")}).encode()
-          req=urllib.request.Request(os.environ["SHEET_ENDPOINT"],data=body,headers={"Content-Type":"text/plain;charset=utf-8"})
-          with urllib.request.urlopen(req,timeout=45) as r:
-              data=json.loads(r.read().decode())
-          if not data.get("ok"):
+          set -euo pipefail
+          payload=$(python3 - <<'PY'
+          import json, os
+          print(json.dumps({"action":"closeCloudRun","runId":os.environ["RUN_ID"],"workflowResult":os.environ.get("WORKFLOW_RESULT","")}))
+          PY
+          )
+          response=$(curl --fail-with-body --silent --show-error --location --max-time 60 \
+            -H 'Content-Type: text/plain;charset=utf-8' \
+            --data-binary "$payload" \
+            "$SHEET_ENDPOINT")
+          RESPONSE="$response" python3 - <<'PY'
+          import json, os
+          data=json.loads(os.environ['RESPONSE'])
+          if not data.get('ok'):
               raise SystemExit(data)
           print(data)
           PY
