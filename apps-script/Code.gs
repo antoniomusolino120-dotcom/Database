@@ -86,7 +86,13 @@ function workerKey_(idx){return CLOUD_WORKER_PREFIX+String(idx);}
 function nowIso_(){return new Date().toISOString();}
 
 function normalizedMapsUrl_(url){return String(url||'').trim().split('#')[0].split('?')[0].replace(/\/$/,'');}
-function normalizedPhone_(phone){return String(phone||'').replace(/\D/g,'').replace(/^0039/,'39').replace(/^39(?=\d{8,})/,'');}
+function normalizedPhone_(phone){
+  const raw=String(phone??'').trim();
+  let digits=raw.replace(/\D/g,'');
+  if(/^\+\s*39/.test(raw))digits=digits.slice(2);
+  else if(digits.indexOf('0039')===0)digits=digits.slice(4);
+  return digits;
+}
 function normalizedText_(s){return String(s||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9]+/g,' ').trim();}
 function normalizedDomain_(website){
   let s=String(website||'').trim().toLowerCase();if(!s)return '';
@@ -135,25 +141,44 @@ function mergeMaster_(current,candidate,now){
   };
 }
 
+function mapsKeyConflict_(a,b){
+  const ak=String((a&&a.mapsKey)||'').trim(),bk=String((b&&b.mapsKey)||'').trim();
+  return Boolean(ak&&bk&&ak!==bk);
+}
+function findFinalDuplicate_(index,rows,candidate){
+  const f=masterFingerprint_(candidate||{});
+  if(f.mapsKey&&index.mapsKey[f.mapsKey]!==undefined)return {idx:index.mapsKey[f.mapsKey],reason:'mapsKey'};
+  if(f.mapsUrl&&index.mapsUrl[f.mapsUrl]!==undefined)return {idx:index.mapsUrl[f.mapsUrl],reason:'mapsUrl'};
+  if(f.nameAddress){
+    const matches=index.nameAddress[f.nameAddress]||[];
+    for(let i=0;i<matches.length;i++){
+      const idx=matches[i];
+      if(!mapsKeyConflict_(candidate,rows[idx]))return {idx,reason:'nameAddress'};
+    }
+  }
+  return {idx:-1,reason:''};
+}
 function dedupAndWriteFinalUnlocked_(candidates){
   const sh=ensureSheet_('MASTER',HEADERS.MASTER),last=sh.getLastRow();
   const values=last>=2?sh.getRange(2,1,last-1,HEADERS.MASTER.length).getValues():[];
   const rows=values.map((r,i)=>masterObjectFromValues_(r,i+2));
-  const index={mapsKey:{},mapsUrl:{},phone:{},nameAddress:{},nameDomain:{}};
+  const index={mapsKey:{},mapsUrl:{},nameAddress:{}};
   const put=(row,idx)=>{
     const f=masterFingerprint_(row);
-    Object.keys(index).forEach(k=>{if(f[k]&&index[k][f[k]]===undefined)index[k][f[k]]=idx;});
+    if(f.mapsKey&&index.mapsKey[f.mapsKey]===undefined)index.mapsKey[f.mapsKey]=idx;
+    if(f.mapsUrl&&index.mapsUrl[f.mapsUrl]===undefined)index.mapsUrl[f.mapsUrl]=idx;
+    if(f.nameAddress){
+      const list=index.nameAddress[f.nameAddress]||(index.nameAddress[f.nameAddress]=[]);
+      if(list.indexOf(idx)<0)list.push(idx);
+    }
   };
   rows.forEach((r,i)=>put(r,i));
   let nextId=nextFmiNumber_(values),inserted=0,duplicates=0;
   const changedExisting={},newRows=[],items=[],now=nowIso_();
 
   (candidates||[]).forEach(candidate=>{
-    const f=masterFingerprint_(candidate||{});
-    let idx=-1,reason='';
-    for(const k of ['mapsKey','mapsUrl','phone','nameAddress','nameDomain']){
-      if(f[k]&&index[k][f[k]]!==undefined){idx=index[k][f[k]];reason=k;break;}
-    }
+    const match=findFinalDuplicate_(index,rows,candidate||{});
+    const idx=match.idx,reason=match.reason;
     if(idx>=0){
       rows[idx]=mergeMaster_(rows[idx],candidate,now);put(rows[idx],idx);
       if(idx<values.length)changedExisting[idx]=rows[idx];
@@ -163,9 +188,9 @@ function dedupAndWriteFinalUnlocked_(candidates){
     }else{
       const id=candidate.id||`FMI-${String(nextId++).padStart(7,'0')}`;
       const row=mergeMaster_({},Object.assign({},candidate,{id}),now);
-      rows.push(row);idx=rows.length-1;put(row,idx);
+      rows.push(row);const newIdx=rows.length-1;put(row,newIdx);
       newRows.push(row);inserted++;
-      items.push({mode:'inserted',reason:'new',sheetRow:idx+2,id:row.id,mapsKey:row.mapsKey,mapsUrl:row.mapsUrl});
+      items.push({mode:'inserted',reason:'new',sheetRow:newIdx+2,id:row.id,mapsKey:row.mapsKey,mapsUrl:row.mapsUrl});
     }
   });
 
