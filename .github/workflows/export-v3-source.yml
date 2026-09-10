@@ -1,0 +1,58 @@
+name: Export verified V3 scraper sources
+
+on:
+  push:
+    branches: [collector-shared-queue-cloud]
+    paths:
+      - '.github/workflows/export-v3-source.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Reconstruct verified V3 base
+        shell: bash
+        run: |
+          BASE_COMMIT="edc8c985e9e2f6e9bc205e24889ff2169dd696cd"
+          git fetch --depth=1 origin "$BASE_COMMIT"
+          mkdir -p /tmp/fmi-v3-parts
+          for n in 00 01 02 03 04; do
+            git show "$BASE_COMMIT:.bootstrap/source.part${n}.b64" > "/tmp/fmi-v3-parts/source.part${n}.b64"
+          done
+          python3 - <<'PY'
+          import base64, pathlib
+          parts=[pathlib.Path(f'/tmp/fmi-v3-parts/source.part{i:02d}.b64').read_bytes() for i in range(5)]
+          if len(parts[3]) == 8999:
+              parts[3] = parts[3][:2408] + b'n' + parts[3][2408:]
+          pathlib.Path('source.zip').write_bytes(base64.b64decode(b''.join(parts), validate=True))
+          PY
+          echo "a98699a516c7f07cc553075d40d595691cced918c4cf71b90c53d8c450dd119c  source.zip" | sha256sum -c -
+          unzip -q source.zip
+
+      - name: Apply V3.2 hotfix
+        run: python3 .hotfix/patch_v32.py
+
+      - name: Collect scraper sources
+        shell: bash
+        run: |
+          mkdir -p exported/main/services
+          cp findmyink-collector/main/services/browserCollector.js exported/main/services/
+          cp findmyink-collector/main/services/collectorEngine.js exported/main/services/
+          cp findmyink-collector/main/services/database.js exported/main/services/
+          cp findmyink-collector/main/services/municipalities.js exported/main/services/
+          cp findmyink-collector/main/services/sheets.js exported/main/services/
+          cp findmyink-collector/package.json exported/
+
+      - name: Upload scraper sources
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-v3-scraper-source
+          path: exported
+          retention-days: 1
