@@ -1,12 +1,22 @@
-FINDMYINK COLLECTOR — BRIDGE GOOGLE SHEET (una sola volta)
+FINDMYINK CLOUD COLLECTOR — SETUP APPS SCRIPT
 
 1. Apri il Google Sheet master.
 2. Estensioni > Apps Script.
-3. Sostituisci Code.gs con il contenuto di questo file Code.gs.
-4. Distribuisci > Nuova distribuzione > Applicazione web.
-5. Esegui come: Me.
-6. Accesso: Chiunque.
-7. Distribuisci e copia l'URL che termina in /exec.
-8. Nel Collector > Impostazioni > Google Sheet, incolla quell'URL e premi Testa e salva.
+3. Sostituisci Code.gs con `apps-script/Code.gs`.
+4. Aggiungi un file HTML chiamato esattamente `dashboard` e incolla `apps-script/dashboard.html`.
+5. Distribuisci > Nuova distribuzione > Applicazione web.
+6. Esegui come: Me.
+7. Accesso: Chiunque.
+8. Distribuisci e copia l'URL che termina in /exec.
+9. In GitHub > repository Database > Settings > Secrets and variables > Actions crea:
+   SHEET_ENDPOINT = URL /exec completo.
+10. Apri la console:
+    <URL /exec>?dashboard=1
+11. Per avviare il collector usa GitHub Actions > FindMyInk Cloud Collector e scegli 3 o 5 browser.
 
-Da quel momento il Collector non usa OAuth, login Google o credentials.json.
+REGOLE:
+- COMUNI colonna G: solo TODO / COMPLETED.
+- COMUNI colonna L: data solo dopo finalizzazione completa.
+- I worker fanno claim dinamici: non possono lavorare sullo stesso comune mentre il lease è attivo.
+- La deduplica finale è una sola e centralizzata nel bridge Apps Script.
+- Le preview Chromium sono temporanee in CacheService e non vengono salvate nello Sheet.
