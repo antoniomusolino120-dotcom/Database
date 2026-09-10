@@ -37,8 +37,31 @@ jobs:
             echo 'workers={"worker":[0,1,2]}' >> "$GITHUB_OUTPUT"
           fi
 
-  worker:
+  init:
     needs: matrix
+    runs-on: ubuntu-latest
+    env:
+      SHEET_ENDPOINT: ${{ secrets.SHEET_ENDPOINT }}
+      RUN_ID: ${{ github.run_id }}
+      WORKER_COUNT: ${{ inputs.workers }}
+    steps:
+      - name: Start central queue
+        shell: bash
+        run: |
+          test -n "$SHEET_ENDPOINT" || (echo 'Missing repository secret SHEET_ENDPOINT' && exit 1)
+          python3 - <<'PY'
+          import json, os, urllib.request
+          body=json.dumps({"action":"startCloudRun","runId":os.environ["RUN_ID"],"workerCount":int(os.environ["WORKER_COUNT"])}).encode()
+          req=urllib.request.Request(os.environ["SHEET_ENDPOINT"],data=body,headers={"Content-Type":"text/plain;charset=utf-8"})
+          with urllib.request.urlopen(req,timeout=45) as r:
+              data=json.loads(r.read().decode())
+          if not data.get("ok"):
+              raise SystemExit(data)
+          print(data)
+          PY
+
+  worker:
+    needs: [matrix, init]
     timeout-minutes: 355
     runs-on: ubuntu-latest
     strategy:
@@ -46,10 +69,12 @@ jobs:
       matrix: ${{ fromJSON(needs.matrix.outputs.workers) }}
     env:
       SHEET_ENDPOINT: ${{ secrets.SHEET_ENDPOINT }}
+      RUN_ID: ${{ github.run_id }}
       WORKER_INDEX: ${{ matrix.worker }}
       WORKER_COUNT: ${{ inputs.workers }}
       MAX_MINUTES: ${{ inputs.max_minutes }}
-      WORK_BATCH_SIZE: '8'
+      LEASE_SECONDS: '900'
+      PREVIEW_INTERVAL_MS: '25000'
       OUTPUT_PATH: cloud-output/worker-${{ matrix.worker }}.json
     steps:
       - name: Checkout
@@ -93,48 +118,39 @@ jobs:
         working-directory: findmyink-collector
         run: npm test
 
-      - name: Run cloud shard
+      - name: Run dynamic cloud worker
         working-directory: findmyink-collector
         shell: bash
         run: xvfb-run -a npx electron cloud/worker.mjs
 
-      - name: Upload shard candidates
+      - name: Upload worker diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cloud-shard-${{ matrix.worker }}
+          name: cloud-worker-${{ matrix.worker }}
           path: findmyink-collector/cloud-output/worker-${{ matrix.worker }}.json
           if-no-files-found: warn
           retention-days: 1
 
-  finalize:
-    needs: [matrix, worker]
-    if: ${{ always() && needs.matrix.result == 'success' }}
-    timeout-minutes: 45
+  close:
+    needs: [matrix, init, worker]
+    if: ${{ always() && needs.init.result == 'success' }}
     runs-on: ubuntu-latest
     env:
       SHEET_ENDPOINT: ${{ secrets.SHEET_ENDPOINT }}
-      ARTIFACT_ROOT: cloud-artifacts
-      FINAL_BATCH_SIZE: '50'
+      RUN_ID: ${{ github.run_id }}
+      WORKFLOW_RESULT: ${{ needs.worker.result }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Require Sheet bridge
+      - name: Close run state
         shell: bash
-        run: test -n "$SHEET_ENDPOINT" || (echo 'Missing repository secret SHEET_ENDPOINT' && exit 1)
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Download all shard candidates
-        uses: actions/download-artifact@v4
-        with:
-          pattern: cloud-shard-*
-          path: cloud-artifacts
-          merge-multiple: true
-
-      - name: Run single final dedup and commit
-        run: node cloud/finalizer.mjs
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          body=json.dumps({"action":"closeCloudRun","runId":os.environ["RUN_ID"],"workflowResult":os.environ.get("WORKFLOW_RESULT","")}).encode()
+          req=urllib.request.Request(os.environ["SHEET_ENDPOINT"],data=body,headers={"Content-Type":"text/plain;charset=utf-8"})
+          with urllib.request.urlopen(req,timeout=45) as r:
+              data=json.loads(r.read().decode())
+          if not data.get("ok"):
+              raise SystemExit(data)
+          print(data)
+          PY
