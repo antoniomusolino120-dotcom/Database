@@ -6,6 +6,7 @@ import { MapsBrowserCollector } from '../main/services/browserCollector.js';
 import { buildMunicipalityQuery } from '../main/services/municipalities.js';
 import { mapsKey, parseCid } from '../main/utils/normalize.js';
 import { isExplicitForeign } from '../main/utils/location.js';
+import { isClearlyOutsideItaly } from './italy-filter.mjs';
 
 app.disableHardwareAcceleration();
 
@@ -152,7 +153,7 @@ async function run(){
             await preview(browser);
             if(candidate.verification)throw new Error('GOOGLE_VERIFICATION_REQUIRED');
             if(!candidate.name||!isTattoo(candidate))continue;
-            if(isExplicitForeign(candidate.address)){foreign++;continue;}
+            if(isExplicitForeign(candidate.address)||isClearlyOutsideItaly(candidate)){foreign++;continue;}
             candidate.mapsKey=candidate.mapsKey||key;
             candidate.mapsUrl=candidate.mapsUrl||link;
             candidates.push(candidate);
