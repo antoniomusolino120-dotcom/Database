@@ -89,6 +89,7 @@ jobs:
       LEASE_SECONDS: '900'
       PREVIEW_INTERVAL_MS: '25000'
       OUTPUT_PATH: cloud-output/worker-${{ matrix.worker }}.json
+      ELECTRON_DISABLE_SECURITY_WARNINGS: 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -134,7 +135,7 @@ jobs:
       - name: Run dynamic cloud worker
         working-directory: findmyink-collector
         shell: bash
-        run: xvfb-run -a npx electron cloud/worker.mjs
+        run: xvfb-run -a npx electron --no-sandbox --disable-setuid-sandbox cloud/worker.mjs
 
       - name: Upload worker diagnostics
         if: always()
