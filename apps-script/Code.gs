@@ -33,6 +33,7 @@ function findRow_(sh,col,value){
 }
 function masterValues_(r){return [r.id||'',r.name||'',r.phone||'',r.website||'',r.address||'',r.lat??'',r.lng??'',r.mapsKey||'',r.mapsUrl||'',r.firstSeen||'',r.lastSeen||''];}
 function municipalityValues_(r){return [r.queueCode||'',r.municipalityId||'',r.name||'',r.province||'',r.provinceCode||'',r.region||'',r.status||'',r.foundCount??0,r.newCount??0,r.duplicateCount??0,r.foreignCount??0,r.lastScanAt||'',r.errorText||''];}
+function municipalityObject_(r,sheetRow,claimToken){return {sheetRow,queueCode:String(r[0]||''),municipalityId:String(r[1]||''),name:String(r[2]||''),province:String(r[3]||''),provinceCode:String(r[4]||''),region:String(r[5]||''),status:String(r[6]||''),lastScanAt:r[11]||'',claimToken:String(claimToken||'')};}
 
 function upsertMaster_(r){return upsertMasters_([r])[0];}
 function upsertMasters_(rows){
@@ -84,6 +85,7 @@ function getJobStateValue_(key){
 function clearDashboardCache_(){CacheService.getScriptCache().remove(CLOUD_DASHBOARD_CACHE);}
 function workerKey_(idx){return CLOUD_WORKER_PREFIX+String(idx);}
 function nowIso_(){return new Date().toISOString();}
+function newClaimToken_(){return Utilities.getUuid();}
 
 function normalizedMapsUrl_(url){return String(url||'').trim().split('#')[0].split('?')[0].replace(/\/$/,'');}
 function normalizedPhone_(phone){
@@ -209,19 +211,25 @@ function upsertCloudMastersFinal_(candidates){
 
 function computeCloudTotals_(){
   const sh=ensureSheet_('COMUNI',HEADERS.COMUNI),last=sh.getLastRow();
-  let total=0,completed=0,todo=0,found=0,newCount=0,duplicates=0,foreign=0,errors=0;
+  const byId={};
   if(last>=2){
-    const vals=sh.getRange(2,7,last-1,7).getValues();
+    const vals=sh.getRange(2,2,last-1,12).getValues();
     vals.forEach(r=>{
-      const status=String(r[0]||'').trim().toUpperCase();
-      if(!status)return;
-      total++;
-      if(status==='COMPLETED'){
-        completed++;found+=Number(r[1])||0;newCount+=Number(r[2])||0;duplicates+=Number(r[3])||0;foreign+=Number(r[4])||0;
-      }else if(status==='TODO')todo++;
-      if(String(r[6]||'').trim())errors++;
+      const municipalityId=String(r[0]||'').trim(),status=String(r[5]||'').trim().toUpperCase();
+      if(!municipalityId||!status)return;
+      const item={status,found:Number(r[6])||0,newCount:Number(r[7])||0,duplicates:Number(r[8])||0,foreign:Number(r[9])||0,lastScanAt:r[10]||'',error:String(r[11]||'')};
+      const current=byId[municipalityId];
+      if(!current||status==='COMPLETED'&&current.status!=='COMPLETED'||status==='COMPLETED'&&current.status==='COMPLETED'&&(Date.parse(item.lastScanAt)||0)>(Date.parse(current.lastScanAt)||0))byId[municipalityId]=item;
+      else if(item.error&&!current.error)current.error=item.error;
     });
   }
+  let total=0,completed=0,todo=0,found=0,newCount=0,duplicates=0,foreign=0,errors=0;
+  Object.keys(byId).forEach(id=>{
+    const r=byId[id];total++;
+    if(r.status==='COMPLETED'){completed++;found+=r.found;newCount+=r.newCount;duplicates+=r.duplicates;foreign+=r.foreign;}
+    else if(r.status==='TODO')todo++;
+    if(r.error)errors++;
+  });
   return {total,completed,todo,found,newCount,duplicates,foreign,errors};
 }
 
@@ -235,7 +243,7 @@ function startCloudRun_(data){
     const state={runId,workerCount,status:'RUNNING',startedAt:now,updatedAt:now,stopRequested:false,finishedAt:null,nextRow:2,totals:computeCloudTotals_()};
     const patch={};patch[CLOUD_RUN_KEY]=state;patch[CLOUD_PENDING_START_KEY]='';
     for(let i=0;i<5;i++){
-      patch[workerKey_(i)]={runId,workerIndex:i,status:i<workerCount?'QUEUED':'OFFLINE',municipalityId:'',municipalityName:'',queueCode:'',phase:i<workerCount?'IN ATTESA':'OFFLINE',query:'',leaseUntil:null,lastSeen:now,found:0,newCount:0,duplicates:0,foreign:0,completedMunicipalities:0};
+      patch[workerKey_(i)]={runId,workerIndex:i,status:i<workerCount?'QUEUED':'OFFLINE',municipalityId:'',municipalityName:'',queueCode:'',phase:i<workerCount?'IN ATTESA':'OFFLINE',query:'',leaseUntil:null,lastSeen:now,claimToken:'',claimSheetRow:0,found:0,newCount:0,duplicates:0,foreign:0,completedMunicipalities:0};
       CacheService.getScriptCache().remove(CLOUD_PREVIEW_PREFIX+runId+':'+i);
     }
     setJobState_(patch);clearDashboardCache_();
@@ -252,42 +260,61 @@ function claimCloudMunicipality_(data){
     if(!run||String(run.runId)!==runId)throw new Error('Run cloud non attivo');
     if(run.stopRequested)return {stopped:true,row:null};
 
-    const nowMs=Date.now(),active={};
+    const sh=ensureSheet_('COMUNI',HEADERS.COMUNI),last=sh.getLastRow();
+    if(last<2)return {stopped:false,row:null,queueExhausted:true};
+    const previous=getJobStateValue_(workerKey_(workerIndex))||{};
+
+    if(String(previous.runId)===runId&&previous.status==='WORKING'&&previous.municipalityId&&previous.claimToken&&Number(previous.claimSheetRow)>=2&&Number(previous.claimSheetRow)<=last){
+      const sheetRow=Number(previous.claimSheetRow),r=sh.getRange(sheetRow,1,1,13).getValues()[0];
+      if(String(r[1]||'')===String(previous.municipalityId)&&String(r[6]||'').trim().toUpperCase()==='TODO'){
+        const renewed=Object.assign({},previous,{leaseUntil:new Date(Date.now()+leaseSeconds*1000).toISOString(),lastSeen:nowIso_()});
+        const p={};p[workerKey_(workerIndex)]=renewed;setJobState_(p);clearDashboardCache_();
+        return {stopped:false,replayed:true,row:municipalityObject_(r,sheetRow,previous.claimToken)};
+      }
+    }
+
+    const values=sh.getRange(2,1,last-1,13).getValues(),completedIds={},active={};
+    values.forEach(r=>{const id=String(r[1]||'').trim(),status=String(r[6]||'').trim().toUpperCase();if(id&&status==='COMPLETED')completedIds[id]=true;});
+    const nowMs=Date.now();
     for(let i=0;i<Number(run.workerCount||0);i++){
+      if(i===workerIndex)continue;
       const w=getJobStateValue_(workerKey_(i));
       if(!w||String(w.runId)!==runId||w.status!=='WORKING'||!w.municipalityId)continue;
       const until=Date.parse(w.leaseUntil||'')||0;
       if(until>nowMs)active[String(w.municipalityId)]=true;
     }
 
-    const sh=ensureSheet_('COMUNI',HEADERS.COMUNI),last=sh.getLastRow();
-    if(last<2)return {stopped:false,row:null};
-    const values=sh.getRange(2,1,last-1,13).getValues();
     const startRow=Math.max(2,Math.min(last,Number(run.nextRow)||2));
     const order=[];
     for(let row=startRow;row<=last;row++)order.push(row);
     for(let row=2;row<startRow;row++)order.push(row);
-    let selected=null;
+    let selected=null,blockedTodo=0;
     for(const sheetRow of order){
       const r=values[sheetRow-2],municipalityId=String(r[1]||'').trim(),status=String(r[6]||'').trim().toUpperCase(),error=String(r[12]||'');
-      if(!municipalityId||status!=='TODO'||active[municipalityId])continue;
+      if(!municipalityId||status!=='TODO'||completedIds[municipalityId])continue;
       if(error.indexOf('[run:'+runId+']')===0)continue;
-      selected={sheetRow,queueCode:String(r[0]||''),municipalityId,name:String(r[2]||''),province:String(r[3]||''),provinceCode:String(r[4]||''),region:String(r[5]||''),status:'TODO',lastScanAt:r[11]||''};
+      if(active[municipalityId]){blockedTodo++;continue;}
+      selected=municipalityObject_(r,sheetRow,newClaimToken_());
       sh.getRange(sheetRow,13).clearContent();
       run.nextRow=sheetRow>=last?2:sheetRow+1;run.updatedAt=nowIso_();
       const rp={};rp[CLOUD_RUN_KEY]=run;setJobState_(rp);
       break;
     }
 
-    const previous=getJobStateValue_(workerKey_(workerIndex))||{};
     const now=nowIso_();
+    if(!selected&&blockedTodo>0){
+      const waiting=Object.assign({},previous,{runId,workerIndex,status:'IDLE',municipalityId:'',municipalityName:'',queueCode:'',phase:'ATTENDO LEASE',query:'',leaseUntil:null,lastSeen:now,claimToken:'',claimSheetRow:0});
+      const p={};p[workerKey_(workerIndex)]=waiting;setJobState_(p);clearDashboardCache_();
+      return {stopped:false,row:null,retry:true,retryAfterMs:5000,eligibleTodo:blockedTodo};
+    }
+
     const worker=selected?Object.assign({},previous,{
       runId,workerIndex,status:'WORKING',municipalityId:selected.municipalityId,municipalityName:selected.name,queueCode:selected.queueCode,
       phase:'ASSEGNATO',query:'',leaseUntil:new Date(Date.now()+leaseSeconds*1000).toISOString(),lastSeen:now,
-      found:0,newCount:0,duplicates:0,foreign:0
-    }):Object.assign({},previous,{runId,workerIndex,status:'DONE',municipalityId:'',municipalityName:'',queueCode:'',phase:'CODA COMPLETATA',query:'',leaseUntil:null,lastSeen:now});
+      claimToken:selected.claimToken,claimSheetRow:selected.sheetRow,found:0,newCount:0,duplicates:0,foreign:0,lastError:''
+    }):Object.assign({},previous,{runId,workerIndex,status:'DONE',municipalityId:'',municipalityName:'',queueCode:'',phase:'CODA COMPLETATA',query:'',leaseUntil:null,lastSeen:now,claimToken:'',claimSheetRow:0});
     const p={};p[workerKey_(workerIndex)]=worker;setJobState_(p);clearDashboardCache_();
-    return {stopped:false,row:selected};
+    return {stopped:false,row:selected,queueExhausted:!selected};
   }finally{lock.releaseLock();}
 }
 
@@ -303,8 +330,9 @@ function heartbeatCloudWorker_(data){
       runId,workerIndex,lastSeen:nowIso_(),
       leaseUntil:current.municipalityId?new Date(Date.now()+leaseSeconds*1000).toISOString():null
     });
+    if(run.stopRequested){merged.status='STOPPING';merged.phase='ARRESTO RICHIESTO';}
     delete merged.previewBase64;
-    const p={};p[workerKey_(workerIndex)]=merged;setJobState_(p);
+    const p={};p[workerKey_(workerIndex)]=merged;setJobState_(p);clearDashboardCache_();
     return {ok:true,stopRequested:Boolean(run.stopRequested)};
   }finally{lock.releaseLock();}
 }
@@ -318,63 +346,78 @@ function updateCloudPreview_(data){
 }
 
 function finalizeCloudMunicipality_(data){
-  const runId=String(data.runId||'').trim(),workerIndex=Number(data.workerIndex),municipalityId=String(data.municipalityId||'').trim();
-  if(!runId||!municipalityId||!Number.isInteger(workerIndex))throw new Error('Finalizzazione non valida');
+  const runId=String(data.runId||'').trim(),workerIndex=Number(data.workerIndex),municipalityId=String(data.municipalityId||'').trim(),claimToken=String(data.claimToken||'').trim(),claimSheetRow=Number(data.claimSheetRow)||0;
+  if(!runId||!municipalityId||!claimToken||!Number.isInteger(workerIndex))throw new Error('Finalizzazione non valida');
   const lock=LockService.getScriptLock();lock.waitLock(30000);
   try{
     const run=getJobStateValue_(CLOUD_RUN_KEY);
     const worker=getJobStateValue_(workerKey_(workerIndex))||{};
     if(!run||String(run.runId)!==runId)throw new Error('Run cloud non attivo');
-    if(String(worker.runId)!==runId||String(worker.municipalityId)!==municipalityId)throw new Error('Lease non appartenente al worker');
+
+    if(String(worker.lastFinalizedClaimToken||'')===claimToken&&String(worker.lastFinalizedMunicipalityId||'')===municipalityId){
+      const receipt=worker.lastFinalizedResult||{};
+      return {alreadyFinalized:true,sheetRow:Number(receipt.sheetRow)||claimSheetRow,completedAt:receipt.completedAt||'',inserted:Number(receipt.inserted)||0,duplicates:Number(receipt.duplicates)||0,finalDuplicates:Number(receipt.finalDuplicates)||0,items:[]};
+    }
+    if(String(worker.runId)!==runId||String(worker.municipalityId)!==municipalityId||String(worker.claimToken||'')!==claimToken||Number(worker.claimSheetRow)!==claimSheetRow)throw new Error('Lease non appartenente al worker');
+
+    const sh=ensureSheet_('COMUNI',HEADERS.COMUNI),last=sh.getLastRow();
+    if(claimSheetRow<2||claimSheetRow>last)throw new Error('Riga lease non valida');
+    const current=sh.getRange(claimSheetRow,1,1,13).getValues()[0];
+    if(String(current[1]||'')!==municipalityId)throw new Error('Municipality ID non corrisponde alla lease');
+
+    const currentStatus=String(current[6]||'').trim().toUpperCase();
+    if(currentStatus==='COMPLETED'){
+      const receipt={sheetRow:claimSheetRow,completedAt:current[11]||'',inserted:Number(current[8])||0,duplicates:Number(current[9])||0,finalDuplicates:0};
+      const updated=Object.assign({},worker,{status:'IDLE',municipalityId:'',municipalityName:'',queueCode:'',phase:'COMUNE COMPLETATO',query:'',leaseUntil:null,lastSeen:nowIso_(),claimToken:'',claimSheetRow:0,lastFinalizedClaimToken:claimToken,lastFinalizedMunicipalityId:municipalityId,lastFinalizedResult:receipt});
+      const p={};p[workerKey_(workerIndex)]=updated;setJobState_(p);clearDashboardCache_();
+      return {alreadyFinalized:true,...receipt,items:[]};
+    }
+    if(currentStatus!=='TODO')throw new Error('Comune non finalizzabile: '+currentStatus);
 
     const result=dedupAndWriteFinalUnlocked_(data.candidates||[]);
-    const sh=ensureSheet_('COMUNI',HEADERS.COMUNI),row=findRow_(sh,2,municipalityId);if(row<0)throw new Error('Municipality ID non trovato');
     const completedAt=data.completedAt||nowIso_();
-    const preDup=Number(data.preDuplicateCount)||0,finalDup=Number(result.duplicates)||0;
-    sh.getRange(row,7,1,7).setValues([[
-      'COMPLETED',Number(data.foundCount)||0,Number(result.inserted)||0,preDup+finalDup,Number(data.foreignCount)||0,completedAt,''
+    const preDup=Number(data.preDuplicateCount)||0,finalDup=Number(result.duplicates)||0,totalDup=preDup+finalDup;
+    sh.getRange(claimSheetRow,7,1,7).setValues([[
+      'COMPLETED',Number(data.foundCount)||0,Number(result.inserted)||0,totalDup,Number(data.foreignCount)||0,completedAt,''
     ]]);
-    run.totals=run.totals||computeCloudTotals_();
-    run.totals.completed=Number(run.totals.completed||0)+1;
-    run.totals.todo=Math.max(0,Number(run.totals.todo||0)-1);
-    run.totals.found=Number(run.totals.found||0)+(Number(data.foundCount)||0);
-    run.totals.newCount=Number(run.totals.newCount||0)+Number(result.inserted||0);
-    run.totals.duplicates=Number(run.totals.duplicates||0)+preDup+finalDup;
-    run.totals.foreign=Number(run.totals.foreign||0)+(Number(data.foreignCount)||0);
-    run.updatedAt=nowIso_();
+    run.totals=computeCloudTotals_();run.updatedAt=nowIso_();
     const runPatch={};runPatch[CLOUD_RUN_KEY]=run;setJobState_(runPatch);
 
+    const receipt={sheetRow:claimSheetRow,completedAt,inserted:Number(result.inserted)||0,duplicates:totalDup,finalDuplicates:finalDup};
     const updated=Object.assign({},worker,{
-      status:'IDLE',municipalityId:'',municipalityName:'',queueCode:'',phase:'COMUNE COMPLETATO',query:'',leaseUntil:null,lastSeen:nowIso_(),
-      found:Number(worker.foundTotal||0)+(Number(data.foundCount)||0),
-      newCount:Number(worker.newTotal||0)+Number(result.inserted||0),
-      duplicates:Number(worker.duplicateTotal||0)+preDup+finalDup,
-      foreign:Number(worker.foreignTotal||0)+(Number(data.foreignCount)||0),
+      status:'IDLE',municipalityId:'',municipalityName:'',queueCode:'',phase:'COMUNE COMPLETATO',query:'',leaseUntil:null,lastSeen:nowIso_(),claimToken:'',claimSheetRow:0,
+      found:Number(data.foundCount)||0,newCount:Number(result.inserted)||0,duplicates:totalDup,foreign:Number(data.foreignCount)||0,
       foundTotal:Number(worker.foundTotal||0)+(Number(data.foundCount)||0),
       newTotal:Number(worker.newTotal||0)+Number(result.inserted||0),
-      duplicateTotal:Number(worker.duplicateTotal||0)+preDup+finalDup,
+      duplicateTotal:Number(worker.duplicateTotal||0)+totalDup,
       foreignTotal:Number(worker.foreignTotal||0)+(Number(data.foreignCount)||0),
-      completedMunicipalities:Number(worker.completedMunicipalities||0)+1
+      completedMunicipalities:Number(worker.completedMunicipalities||0)+1,
+      lastFinalizedClaimToken:claimToken,lastFinalizedMunicipalityId:municipalityId,lastFinalizedResult:receipt
     });
     const p={};p[workerKey_(workerIndex)]=updated;setJobState_(p);clearDashboardCache_();
-    return {sheetRow:row,completedAt,inserted:result.inserted,duplicates:preDup+finalDup,finalDuplicates:finalDup,items:result.items};
+    return {...receipt,items:result.items};
   }finally{lock.releaseLock();}
 }
 
 function failCloudMunicipality_(data){
-  const runId=String(data.runId||'').trim(),workerIndex=Number(data.workerIndex),municipalityId=String(data.municipalityId||'').trim();
+  const runId=String(data.runId||'').trim(),workerIndex=Number(data.workerIndex),municipalityId=String(data.municipalityId||'').trim(),claimToken=String(data.claimToken||'').trim(),claimSheetRow=Number(data.claimSheetRow)||0;
   const lock=LockService.getScriptLock();lock.waitLock(10000);
   try{
-    const sh=ensureSheet_('COMUNI',HEADERS.COMUNI),row=findRow_(sh,2,municipalityId);if(row<0)throw new Error('Municipality ID non trovato');
+    const run=getJobStateValue_(CLOUD_RUN_KEY);
+    const worker=Number.isInteger(workerIndex)?getJobStateValue_(workerKey_(workerIndex))||{}:{};
+    if(!run||String(run.runId)!==runId)return {ignored:true,reason:'stale-run'};
+    if(String(worker.lastFailedClaimToken||'')===claimToken&&claimToken)return {alreadyFailed:true};
+    if(!claimToken||String(worker.runId)!==runId||String(worker.municipalityId)!==municipalityId||String(worker.claimToken||'')!==claimToken||Number(worker.claimSheetRow)!==claimSheetRow)return {ignored:true,reason:'stale-lease'};
+
+    const sh=ensureSheet_('COMUNI',HEADERS.COMUNI),last=sh.getLastRow();
+    if(claimSheetRow<2||claimSheetRow>last)return {ignored:true,reason:'invalid-row'};
+    const currentId=String(sh.getRange(claimSheetRow,2).getValue()||'');if(currentId!==municipalityId)return {ignored:true,reason:'row-mismatch'};
     const message='[run:'+runId+'] '+String(data.error||'Errore worker cloud').slice(0,430);
-    sh.getRange(row,13).setValue(message);
-    if(Number.isInteger(workerIndex)){
-      const worker=getJobStateValue_(workerKey_(workerIndex))||{};
-      const p={};p[workerKey_(workerIndex)]=Object.assign({},worker,{status:'IDLE',municipalityId:'',municipalityName:'',queueCode:'',phase:'ERRORE - PASSO AL PROSSIMO',query:'',leaseUntil:null,lastSeen:nowIso_(),lastError:message});
-      setJobState_(p);
-    }
-    const run=getJobStateValue_(CLOUD_RUN_KEY);if(run&&String(run.runId)===runId){run.totals=run.totals||{};run.totals.errors=Number(run.totals.errors||0)+1;run.updatedAt=nowIso_();const rp={};rp[CLOUD_RUN_KEY]=run;setJobState_(rp);}
-    clearDashboardCache_();return {sheetRow:row};
+    sh.getRange(claimSheetRow,13).setValue(message);
+    const p={};p[workerKey_(workerIndex)]=Object.assign({},worker,{status:'IDLE',municipalityId:'',municipalityName:'',queueCode:'',phase:'ERRORE - PASSO AL PROSSIMO',query:'',leaseUntil:null,lastSeen:nowIso_(),claimToken:'',claimSheetRow:0,lastError:message,lastFailedClaimToken:claimToken});
+    setJobState_(p);
+    run.totals=computeCloudTotals_();run.updatedAt=nowIso_();const rp={};rp[CLOUD_RUN_KEY]=run;setJobState_(rp);
+    clearDashboardCache_();return {sheetRow:claimSheetRow};
   }finally{lock.releaseLock();}
 }
 
@@ -384,17 +427,17 @@ function finishCloudWorker_(data){
   try{
     const run=getJobStateValue_(CLOUD_RUN_KEY)||{};
     const worker=getJobStateValue_(workerKey_(workerIndex))||{};
-    const p={};p[workerKey_(workerIndex)]=Object.assign({},worker,{runId,workerIndex,status:'DONE',municipalityId:'',municipalityName:'',queueCode:'',phase:'TERMINATO',query:'',leaseUntil:null,lastSeen:nowIso_()});
+    if(String(run.runId||'')!==runId||String(worker.runId||'')!==runId)return {stale:true,status:run.status||'IDLE'};
+    const p={};p[workerKey_(workerIndex)]=Object.assign({},worker,{runId,workerIndex,status:'DONE',municipalityId:'',municipalityName:'',queueCode:'',phase:run.stopRequested?'ARRESTATO':'TERMINATO',query:'',leaseUntil:null,lastSeen:nowIso_(),claimToken:'',claimSheetRow:0});
     setJobState_(p);
-    let allDone=true,errors=0;
+    let allDone=true;
     for(let i=0;i<Number(run.workerCount||0);i++){
       const w=i===workerIndex?p[workerKey_(workerIndex)]:getJobStateValue_(workerKey_(i));
       if(!w||w.status!=='DONE')allDone=false;
-      if(w&&w.lastError)errors++;
     }
     if(allDone){
       run.status=run.stopRequested?'STOPPED':'WORKERS_DONE';
-      run.finishedAt=nowIso_();run.updatedAt=run.finishedAt;
+      run.finishedAt=nowIso_();run.updatedAt=run.finishedAt;run.totals=computeCloudTotals_();
       const r={};r[CLOUD_RUN_KEY]=run;setJobState_(r);
     }
     clearDashboardCache_();return {allDone,status:run.status||'RUNNING'};
@@ -421,9 +464,21 @@ function requestCloudStop_(){
   const lock=LockService.getScriptLock();lock.waitLock(10000);
   try{
     const run=getJobStateValue_(CLOUD_RUN_KEY);
-    if(!run)return {ok:false};
-    run.stopRequested=true;run.status='STOPPING';run.updatedAt=nowIso_();
-    const p={};p[CLOUD_RUN_KEY]=run;setJobState_(p);clearDashboardCache_();return {ok:true};
+    if(!run)return {ok:false,status:'IDLE'};
+    const status=String(run.status||'');
+    if(!['RUNNING','STOPPING','WORKERS_DONE'].includes(status))return {ok:true,alreadyStopped:true,status};
+    if(status==='WORKERS_DONE'){
+      run.stopRequested=true;run.status='STOPPED';run.finishedAt=nowIso_();run.updatedAt=run.finishedAt;
+      const onlyRun={};onlyRun[CLOUD_RUN_KEY]=run;setJobState_(onlyRun);clearDashboardCache_();return {ok:true,status:'STOPPED'};
+    }
+    run.stopRequested=true;run.status='STOPPING';run.stopRequestedAt=run.stopRequestedAt||nowIso_();run.updatedAt=nowIso_();
+    const patch={};patch[CLOUD_RUN_KEY]=run;
+    for(let i=0;i<Number(run.workerCount||0);i++){
+      const key=workerKey_(i),w=getJobStateValue_(key)||{};
+      if(String(w.runId||'')!==String(run.runId)||['DONE','OFFLINE'].includes(String(w.status||'')))continue;
+      patch[key]=Object.assign({},w,{status:'STOPPING',phase:'ARRESTO RICHIESTO'});
+    }
+    setJobState_(patch);clearDashboardCache_();return {ok:true,status:'STOPPING'};
   }finally{lock.releaseLock();}
 }
 
@@ -431,8 +486,17 @@ function cloudSummary_(){
   const cached=CacheService.getScriptCache().get(CLOUD_DASHBOARD_CACHE);
   if(cached){try{return JSON.parse(cached);}catch{}}
   const run=getJobStateValue_(CLOUD_RUN_KEY)||{status:'IDLE',workerCount:0,runId:'',totals:computeCloudTotals_()};
-  const workers=[];
-  for(let i=0;i<5;i++)workers.push(getJobStateValue_(workerKey_(i))||{workerIndex:i,status:'OFFLINE'});
+  const workers=[],nowMs=Date.now();
+  for(let i=0;i<5;i++){
+    const raw=getJobStateValue_(workerKey_(i))||{workerIndex:i,status:'OFFLINE'};
+    const w=Object.assign({},raw);
+    if(run.stopRequested&&String(w.runId||'')===String(run.runId||'')&&!['DONE','OFFLINE'].includes(String(w.status||''))){w.status='STOPPING';w.phase='ARRESTO RICHIESTO';}
+    else if(w.status==='WORKING'){
+      const lease=Date.parse(w.leaseUntil||'')||0,lastSeen=Date.parse(w.lastSeen||'')||0;
+      if(lease&&lease<nowMs||lastSeen&&nowMs-lastSeen>Math.max(120000,CLOUD_DEFAULT_LEASE_SECONDS*1000)){w.status='STALLED';w.phase='LEASE SCADUTA';}
+    }
+    workers.push(w);
+  }
   const pendingStart=getJobStateValue_(CLOUD_PENDING_START_KEY);const summary={run,workers,totals:run.totals||computeCloudTotals_(),pendingStart,console:{githubConfigured:Boolean(githubToken_())},generatedAt:nowIso_()};
   CacheService.getScriptCache().put(CLOUD_DASHBOARD_CACHE,JSON.stringify(summary),8);
   return summary;
