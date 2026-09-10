@@ -50,28 +50,76 @@ jobs:
       RUN_ID: ${{ github.run_id }}
       WORKER_COUNT: ${{ inputs.workers }}
     steps:
-      - name: Start central queue
+      - name: Start and verify central queue
         shell: bash
         run: |
-          set -euo pipefail
+          set -u
           test -n "$SHEET_ENDPOINT" || (echo 'Missing repository secret SHEET_ENDPOINT' && exit 1)
-          payload=$(python3 - <<'PY'
+
+          start_payload=$(python3 - <<'PY'
           import json, os
           print(json.dumps({"action":"startCloudRun","runId":os.environ["RUN_ID"],"workerCount":int(os.environ["WORKER_COUNT"])}))
           PY
           )
-          response=$(curl --fail-with-body --silent --show-error --location --max-time 75 \
-            --retry 6 --retry-all-errors --retry-delay 2 \
-            -H 'Content-Type: text/plain;charset=utf-8' \
-            --data-binary "$payload" \
-            "$SHEET_ENDPOINT")
-          RESPONSE="$response" python3 - <<'PY'
-          import json, os
-          data=json.loads(os.environ['RESPONSE'])
-          if not data.get('ok'):
-              raise SystemExit(data)
-          print(data)
+          verify_payload='{"action":"getCloudDashboardState","previewTimes":{}}'
+
+          valid_start() {
+            RESPONSE="$1" python3 - <<'PY'
+          import json, os, sys
+          try:
+              data=json.loads(os.environ.get('RESPONSE',''))
+          except Exception:
+              sys.exit(1)
+          ok=data.get('ok') is True and str(data.get('runId','')) == os.environ['RUN_ID'] and data.get('status') == 'RUNNING'
+          sys.exit(0 if ok else 1)
           PY
+          }
+
+          valid_state() {
+            RESPONSE="$1" python3 - <<'PY'
+          import json, os, sys
+          try:
+              data=json.loads(os.environ.get('RESPONSE',''))
+          except Exception:
+              sys.exit(1)
+          run=data.get('run') or {}
+          ok=data.get('ok') is True and str(run.get('runId','')) == os.environ['RUN_ID'] and run.get('status') == 'RUNNING'
+          sys.exit(0 if ok else 1)
+          PY
+          }
+
+          for attempt in $(seq 1 12); do
+            echo "Apps Script init attempt $attempt/12"
+            response=$(curl --silent --show-error --location --connect-timeout 15 --max-time 75 \
+              -H 'Content-Type: text/plain;charset=utf-8' \
+              --data-binary "$start_payload" \
+              "$SHEET_ENDPOINT" 2>curl-start.err || true)
+
+            if valid_start "$response"; then
+              echo "Central queue started and acknowledged."
+              exit 0
+            fi
+
+            # Apps Script can execute the POST and then return a transient 404/empty
+            # response on the redirect. Verify the authoritative state before retrying
+            # the mutating start request.
+            verify=$(curl --silent --show-error --location --connect-timeout 15 --max-time 45 \
+              -H 'Content-Type: text/plain;charset=utf-8' \
+              --data-binary "$verify_payload" \
+              "$SHEET_ENDPOINT" 2>curl-verify.err || true)
+
+            if valid_state "$verify"; then
+              echo "Central queue was started despite a transient bridge response error."
+              exit 0
+            fi
+
+            sleep $((attempt * 2))
+          done
+
+          echo 'Unable to start or verify the central queue.'
+          test -s curl-start.err && cat curl-start.err || true
+          test -s curl-verify.err && cat curl-verify.err || true
+          exit 1
 
   worker:
     needs: [matrix, init]
@@ -157,24 +205,62 @@ jobs:
       RUN_ID: ${{ github.run_id }}
       WORKFLOW_RESULT: ${{ needs.worker.result }}
     steps:
-      - name: Close run state
+      - name: Close and verify run state
         shell: bash
         run: |
-          set -euo pipefail
+          set -u
           payload=$(python3 - <<'PY'
           import json, os
           print(json.dumps({"action":"closeCloudRun","runId":os.environ["RUN_ID"],"workflowResult":os.environ.get("WORKFLOW_RESULT","")}))
           PY
           )
-          response=$(curl --fail-with-body --silent --show-error --location --max-time 75 \
-            --retry 6 --retry-all-errors --retry-delay 2 \
-            -H 'Content-Type: text/plain;charset=utf-8' \
-            --data-binary "$payload" \
-            "$SHEET_ENDPOINT")
-          RESPONSE="$response" python3 - <<'PY'
-          import json, os
-          data=json.loads(os.environ['RESPONSE'])
-          if not data.get('ok'):
-              raise SystemExit(data)
-          print(data)
+          verify_payload='{"action":"getCloudDashboardState","previewTimes":{}}'
+
+          closed_state() {
+            RESPONSE="$1" python3 - <<'PY'
+          import json, os, sys
+          try:
+              data=json.loads(os.environ.get('RESPONSE',''))
+          except Exception:
+              sys.exit(1)
+          run=data.get('run') or {}
+          terminal={'STOPPED','INCOMPLETE','COMPLETED','COMPLETED_WITH_ERRORS'}
+          ok=data.get('ok') is True and str(run.get('runId','')) == os.environ['RUN_ID'] and run.get('status') in terminal
+          sys.exit(0 if ok else 1)
           PY
+          }
+
+          for attempt in $(seq 1 10); do
+            response=$(curl --silent --show-error --location --connect-timeout 15 --max-time 75 \
+              -H 'Content-Type: text/plain;charset=utf-8' \
+              --data-binary "$payload" \
+              "$SHEET_ENDPOINT" 2>curl-close.err || true)
+
+            RESPONSE="$response" python3 - <<'PY'
+          import json, sys, os
+          try:
+              data=json.loads(os.environ.get('RESPONSE',''))
+          except Exception:
+              sys.exit(1)
+          sys.exit(0 if data.get('ok') is True else 1)
+          PY
+            if [ $? -eq 0 ]; then
+              echo "Run close acknowledged."
+              exit 0
+            fi
+
+            verify=$(curl --silent --show-error --location --connect-timeout 15 --max-time 45 \
+              -H 'Content-Type: text/plain;charset=utf-8' \
+              --data-binary "$verify_payload" \
+              "$SHEET_ENDPOINT" 2>curl-close-verify.err || true)
+            if closed_state "$verify"; then
+              echo "Run was closed despite a transient bridge response error."
+              exit 0
+            fi
+            sleep $((attempt * 2))
+          done
+
+          echo 'Unable to close or verify the run state.'
+          test -s curl-close.err && cat curl-close.err || true
+          test -s curl-close-verify.err && cat curl-close-verify.err || true
+          exit 1
