@@ -18,6 +18,13 @@ const GITHUB_REPO = 'Database';
 const GITHUB_WORKFLOW = 'cloud-collector.yml';
 const GITHUB_REF = 'main';
 
+const FMG_SECRET_PROPERTY = 'GESTIONALE_BRIDGE_SECRET';
+const FMG_PASSWORD_SHEET = '********';
+const FMG_READ_SHEETS = ['MASTER','ATTIVITA','APPUNTAMENTI','Users'];
+const FMG_APPEND_WIDTH = {ATTIVITA:7,APPUNTAMENTI:6,LOG:3};
+const FMG_UPDATE_WIDTH = {MASTER:11};
+const FMG_DELETE_SHEETS = ['APPUNTAMENTI'];
+
 function json_(obj){return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);}
 function book_(){return SpreadsheetApp.openById(SPREADSHEET_ID);}
 function ensureSheet_(name,headers){
@@ -573,16 +580,117 @@ function startCloudCollector(workerCount,maxMunicipalitiesPerWorker,maxMinutes){
   catch(err){const patch={};patch[CLOUD_PENDING_START_KEY]='';setJobState_(patch);clearDashboardCache_();throw err;}
 }
 
+function fmgRequireSecret_(data){
+  const expected=String(PropertiesService.getScriptProperties().getProperty(FMG_SECRET_PROPERTY)||'');
+  const received=String((data&&data.secret)||'');
+  if(!expected)throw new Error(FMG_SECRET_PROPERTY+' non configurato nelle Proprietà script');
+  if(!received||received!==expected)throw new Error('Bridge gestionale non autorizzato');
+}
+function fmgSheet_(title){
+  const name=String(title||'').trim(),sheet=book_().getSheetByName(name);
+  if(!sheet)throw new Error('Foglio non trovato: '+name);
+  return sheet;
+}
+function fmgSheetNameFromRange_(range){
+  const value=String(range||'').trim();
+  const match=value.match(/^(?:'((?:[^']|'')+)'|([^!]+))!/);
+  if(!match)throw new Error('Range non valido');
+  return String(match[1]||match[2]||'').replace(/''/g,"'").trim();
+}
+function fmgRequireAllowed_(name,allowed){
+  if(allowed.indexOf(String(name||''))<0)throw new Error('Foglio non autorizzato: '+name);
+}
+function fmgGetRange_(data){
+  const range=String(data.range||'').trim(),sheetName=fmgSheetNameFromRange_(range);
+  fmgRequireAllowed_(sheetName,FMG_READ_SHEETS);
+  const values=book_().getRange(range).getValues();
+  return {values};
+}
+function fmgAppendRow_(data){
+  const sheetName=String(data.sheetName||'').trim(),row=Array.isArray(data.row)?data.row:[],width=FMG_APPEND_WIDTH[sheetName];
+  if(!width)throw new Error('Foglio non autorizzato: '+sheetName);
+  if(row.length!==width)throw new Error('Numero colonne non valido per '+sheetName);
+  const lock=LockService.getScriptLock();lock.waitLock(15000);
+  try{
+    const sheet=fmgSheet_(sheetName);
+    if((sheetName==='ATTIVITA'||sheetName==='APPUNTAMENTI')&&row[0]){
+      const last=sheet.getLastRow();
+      if(last>0){
+        const found=sheet.getRange(1,1,last,1).createTextFinder(String(row[0])).matchEntireCell(true).findNext();
+        if(found)return {appended:false,alreadyExists:true,rowNumber:found.getRow()};
+      }
+    }
+    sheet.appendRow(row);
+    return {appended:true,rowNumber:sheet.getLastRow()};
+  }finally{lock.releaseLock();}
+}
+function fmgUpdateRow_(data){
+  const sheetName=String(data.sheetName||'').trim(),rowNumber=Number(data.rowNumber),values=Array.isArray(data.values)?data.values:[],width=FMG_UPDATE_WIDTH[sheetName];
+  if(!width)throw new Error('Foglio non autorizzato: '+sheetName);
+  if(!Number.isInteger(rowNumber)||rowNumber<2)throw new Error('Numero riga non valido');
+  if(values.length!==width)throw new Error('Numero colonne non valido per '+sheetName);
+  const lock=LockService.getScriptLock();lock.waitLock(15000);
+  try{
+    const sheet=fmgSheet_(sheetName);
+    if(rowNumber>sheet.getLastRow())throw new Error('Riga fuori intervallo');
+    if(sheetName==='MASTER'){
+      const existingId=String(sheet.getRange(rowNumber,1).getValue()||'');
+      if(existingId&&String(values[0]||'')!==existingId)throw new Error('ID MASTER non modificabile');
+    }
+    sheet.getRange(rowNumber,1,1,width).setValues([values]);
+    return {updated:true,rowNumber};
+  }finally{lock.releaseLock();}
+}
+function fmgDeleteRow_(data){
+  const sheetName=String(data.sheetName||'').trim(),rowNumber=Number(data.rowNumber);
+  fmgRequireAllowed_(sheetName,FMG_DELETE_SHEETS);
+  if(!Number.isInteger(rowNumber)||rowNumber<2)throw new Error('Numero riga non valido');
+  const lock=LockService.getScriptLock();lock.waitLock(15000);
+  try{
+    const sheet=fmgSheet_(sheetName);
+    if(rowNumber>sheet.getLastRow())throw new Error('Riga fuori intervallo');
+    sheet.deleteRow(rowNumber);
+    return {deleted:true,rowNumber};
+  }finally{lock.releaseLock();}
+}
+function fmgUsers_(){
+  const sheet=fmgSheet_('Users'),last=sheet.getLastRow();
+  if(last<1)return [];
+  return sheet.getRange(1,1,last,1).getValues().flat().map(v=>String(v||'').trim()).filter(Boolean);
+}
+function fmgValidateLogin_(data){
+  const user=String(data.user||'').trim(),password=String(data.password||'');
+  if(!user||!password)return {authenticated:false};
+  const users=fmgUsers_();
+  if(users.indexOf(user)<0)return {authenticated:false};
+  const passwordSheet=fmgSheet_(FMG_PASSWORD_SHEET);
+  const expected=String(passwordSheet.getRange('A1').getValue()||'');
+  if(!expected||password!==expected)return {authenticated:false};
+  return {authenticated:true,user};
+}
+function fmgBridge_(data){
+  fmgRequireSecret_(data);
+  const op=String(data.op||'').trim();
+  if(op==='validateLogin')return fmgValidateLogin_(data);
+  if(op==='getUsers')return {users:fmgUsers_()};
+  if(op==='getRange')return fmgGetRange_(data);
+  if(op==='appendRow')return fmgAppendRow_(data);
+  if(op==='updateRow')return fmgUpdateRow_(data);
+  if(op==='deleteRow')return fmgDeleteRow_(data);
+  throw new Error('Operazione gestionale non supportata: '+op);
+}
+
 function doGet(e){
   ensureAll_();
   if(e&&e.parameter&&String(e.parameter.dashboard||'')==='1'){
     return HtmlService.createHtmlOutputFromFile('dashboard').setTitle('FindMyInk Cloud Console').setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
   }
-  const ss=book_();return json_({ok:true,spreadsheetId:SPREADSHEET_ID,title:ss.getName(),dashboard:'?dashboard=1'});
+  const ss=book_();return json_({ok:true,spreadsheetId:SPREADSHEET_ID,title:ss.getName(),dashboard:'?dashboard=1',gestionaleBridge:true});
 }
 function doPost(e){
   try{
     ensureAll_();const data=JSON.parse((e&&e.postData&&e.postData.contents)||'{}'),action=data.action||'';
+    if(action==='gestionaleBridge')return json_({ok:true,...fmgBridge_(data)});
     if(action==='ping'){const ss=book_();return json_({ok:true,spreadsheetId:SPREADSHEET_ID,title:ss.getName()});}
     if(action==='startCloudRun')return json_({ok:true,...startCloudRun_(data)});
     if(action==='claimCloudMunicipality')return json_({ok:true,...claimCloudMunicipality_(data)});
