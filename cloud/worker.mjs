@@ -17,6 +17,7 @@ const MAX_MINUTES=Math.min(330,Math.max(5,Number(process.env.MAX_MINUTES||300)))
 const OUTPUT_PATH=String(process.env.OUTPUT_PATH||path.join('cloud-output',`worker-${WORKER_INDEX}.json`));
 const PREVIEW_INTERVAL_MS=Math.max(15000,Number(process.env.PREVIEW_INTERVAL_MS||25000));
 const LEASE_SECONDS=Math.max(300,Math.min(1800,Number(process.env.LEASE_SECONDS||900)));
+const MAX_MUNICIPALITIES_PER_WORKER=Math.max(0,Math.min(10000,Number(process.env.MAX_MUNICIPALITIES_PER_WORKER||0)));
 const QUERIES=String(process.env.MAPS_QUERIES||'tattoo,tatuatore,tattoo studio,studio tatuaggi,tattoo artist').split(',').map(x=>x.trim()).filter(Boolean);
 const SETTINGS={
   minDelayMs:Number(process.env.MIN_DELAY_MS||1100),
@@ -30,7 +31,7 @@ const SETTINGS={
 const state={version:3,runId:RUN_ID,workerIndex:WORKER_INDEX,workerCount:WORKER_COUNT,startedAt:new Date().toISOString(),finishedAt:null,municipalities:[],errors:[]};
 const log=(event,meta={})=>console.log(JSON.stringify({ts:new Date().toISOString(),runId:RUN_ID,worker:WORKER_INDEX,event,...meta}));
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-let lastHeartbeat=0,lastPreview=0,stopRequested=false;
+let lastHeartbeat=0,lastPreview=0,stopRequested=false,completedByWorker=0;
 
 async function persist(){await fs.mkdir(path.dirname(OUTPUT_PATH),{recursive:true});await fs.writeFile(OUTPUT_PATH,JSON.stringify(state,null,2));}
 async function sheet(action,payload={},attempts=4){
@@ -107,7 +108,7 @@ async function run(){
     await heartbeat({status:'IDLE',phase:'PRONTO',found:0,newCount:0,duplicates:0,foreign:0},true);
     await preview(browser,true);
 
-    while(Date.now()<deadline&&!stopRequested){
+    while(Date.now()<deadline&&!stopRequested&&(MAX_MUNICIPALITIES_PER_WORKER===0||completedByWorker<MAX_MUNICIPALITIES_PER_WORKER)){
       const claim=await sheet('claimCloudMunicipality',{runId:RUN_ID,workerIndex:WORKER_INDEX,leaseSeconds:LEASE_SECONDS});
       if(claim.stopped){stopRequested=true;break;}
       const municipality=claim.row;
@@ -164,6 +165,7 @@ async function run(){
           foundCount:found,preDuplicateCount:preDuplicates,foreignCount:foreign,candidates,completedAt:new Date().toISOString()
         });
         municipalitiesSinceRefresh++;
+        completedByWorker++;
         for(const item of finalized.items||[]){
           if(item.mapsKey)knownKeys.add(String(item.mapsKey));
           if(item.mapsUrl)knownUrls.add(normalizeMapsUrl(item.mapsUrl));
@@ -193,7 +195,7 @@ async function run(){
     await browser.close().catch(()=>{});
     state.finishedAt=new Date().toISOString();await persist();
     await sheet('finishCloudWorker',{runId:RUN_ID,workerIndex:WORKER_INDEX}).catch(()=>{});
-    log('worker-done',{municipalities:state.municipalities.length,errors:state.errors.length,stopped:stopRequested});
+    log('worker-done',{municipalities:state.municipalities.length,completedByWorker,limit:MAX_MUNICIPALITIES_PER_WORKER,errors:state.errors.length,stopped:stopRequested});
   }
 }
 

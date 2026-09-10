@@ -12,6 +12,11 @@ const CLOUD_WORKER_PREFIX = 'CLOUD_WORKER_';
 const CLOUD_PREVIEW_PREFIX = 'cloud-preview:';
 const CLOUD_DASHBOARD_CACHE = 'cloud-dashboard-summary';
 const CLOUD_DEFAULT_LEASE_SECONDS = 900;
+const CLOUD_PENDING_START_KEY = 'CLOUD_PENDING_START';
+const GITHUB_OWNER = 'antoniomusolino120-dotcom';
+const GITHUB_REPO = 'Database';
+const GITHUB_WORKFLOW = 'cloud-collector.yml';
+const GITHUB_REF = 'main';
 
 function json_(obj){return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);}
 function book_(){return SpreadsheetApp.openById(SPREADSHEET_ID);}
@@ -203,7 +208,7 @@ function startCloudRun_(data){
   try{
     const now=nowIso_();
     const state={runId,workerCount,status:'RUNNING',startedAt:now,updatedAt:now,stopRequested:false,finishedAt:null,nextRow:2,totals:computeCloudTotals_()};
-    const patch={};patch[CLOUD_RUN_KEY]=state;
+    const patch={};patch[CLOUD_RUN_KEY]=state;patch[CLOUD_PENDING_START_KEY]='';
     for(let i=0;i<5;i++){
       patch[workerKey_(i)]={runId,workerIndex:i,status:i<workerCount?'QUEUED':'OFFLINE',municipalityId:'',municipalityName:'',queueCode:'',phase:i<workerCount?'IN ATTESA':'OFFLINE',query:'',leaseUntil:null,lastSeen:now,found:0,newCount:0,duplicates:0,foreign:0,completedMunicipalities:0};
       CacheService.getScriptCache().remove(CLOUD_PREVIEW_PREFIX+runId+':'+i);
@@ -363,7 +368,7 @@ function finishCloudWorker_(data){
       if(w&&w.lastError)errors++;
     }
     if(allDone){
-      run.status=run.stopRequested?'STOPPED':(errors?'COMPLETED_WITH_ERRORS':'COMPLETED');
+      run.status=run.stopRequested?'STOPPED':'WORKERS_DONE';
       run.finishedAt=nowIso_();run.updatedAt=run.finishedAt;
       const r={};r[CLOUD_RUN_KEY]=run;setJobState_(r);
     }
@@ -403,7 +408,7 @@ function cloudSummary_(){
   const run=getJobStateValue_(CLOUD_RUN_KEY)||{status:'IDLE',workerCount:0,runId:'',totals:computeCloudTotals_()};
   const workers=[];
   for(let i=0;i<5;i++)workers.push(getJobStateValue_(workerKey_(i))||{workerIndex:i,status:'OFFLINE'});
-  const summary={run,workers,totals:run.totals||computeCloudTotals_(),generatedAt:nowIso_()};
+  const pendingStart=getJobStateValue_(CLOUD_PENDING_START_KEY);const summary={run,workers,totals:run.totals||computeCloudTotals_(),pendingStart,console:{githubConfigured:Boolean(githubToken_())},generatedAt:nowIso_()};
   CacheService.getScriptCache().put(CLOUD_DASHBOARD_CACHE,JSON.stringify(summary),8);
   return summary;
 }
@@ -438,6 +443,45 @@ function completeCloudMunicipality_(data){
     sh.getRange(row,7,1,7).setValues([['COMPLETED',Number(data.foundCount)||0,Number(data.newCount)||0,Number(data.duplicateCount)||0,Number(data.foreignCount)||0,completedAt,'']]);
     return {alreadyCompleted:false,sheetRow:row,completedAt};
   }finally{lock.releaseLock();}
+}
+
+function githubToken_(){
+  return String(PropertiesService.getScriptProperties().getProperty('GITHUB_TOKEN')||'').trim();
+}
+
+function githubDispatch_(workerCount,maxMunicipalitiesPerWorker,maxMinutes){
+  const token=githubToken_();
+  if(!token)throw new Error('GITHUB_TOKEN non configurato nelle Proprietà script');
+  const url='https://api.github.com/repos/'+encodeURIComponent(GITHUB_OWNER)+'/'+encodeURIComponent(GITHUB_REPO)+'/actions/workflows/'+encodeURIComponent(GITHUB_WORKFLOW)+'/dispatches';
+  const payload={ref:GITHUB_REF,inputs:{workers:String(workerCount),max_minutes:String(maxMinutes),max_municipalities_per_worker:String(maxMunicipalitiesPerWorker)}};
+  const res=UrlFetchApp.fetch(url,{
+    method:'post',contentType:'application/json',
+    headers:{Authorization:'Bearer '+token,Accept:'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'},
+    payload:JSON.stringify(payload),muteHttpExceptions:true
+  });
+  const code=res.getResponseCode(),body=String(res.getContentText()||'');
+  if(code<200||code>=300)throw new Error('GitHub workflow dispatch HTTP '+code+(body?' · '+body.slice(0,350):''));
+  let parsed={};if(body){try{parsed=JSON.parse(body);}catch{parsed={};}}
+  return {statusCode:code,workflowRunId:parsed.workflow_run_id||null,workflowRunUrl:parsed.html_url||null};
+}
+
+function startCloudCollector(workerCount,maxMunicipalitiesPerWorker,maxMinutes){
+  workerCount=Number(workerCount);
+  maxMunicipalitiesPerWorker=Math.max(0,Math.min(10000,Number(maxMunicipalitiesPerWorker)||0));
+  maxMinutes=Math.max(5,Math.min(330,Number(maxMinutes)||300));
+  if(![3,5].includes(workerCount))throw new Error('Scegli 3 o 5 Chromium');
+  if(!githubToken_())throw new Error('GITHUB_TOKEN non configurato nelle Proprietà script');
+  const lock=LockService.getScriptLock();lock.waitLock(10000);let pending;
+  try{
+    const run=getJobStateValue_(CLOUD_RUN_KEY);
+    if(run&&['RUNNING','STOPPING','WORKERS_DONE'].includes(String(run.status||'')))throw new Error('Esiste già un run attivo: '+String(run.status||''));
+    const currentPending=getJobStateValue_(CLOUD_PENDING_START_KEY);
+    if(currentPending&&currentPending.requestedAt){const age=Date.now()-(Date.parse(currentPending.requestedAt)||0);if(age>=0&&age<90000)throw new Error('Avvio già richiesto, attendi che GitHub prepari i worker');}
+    pending={requestedAt:nowIso_(),workerCount,maxMunicipalitiesPerWorker,maxMinutes};
+    const patch={};patch[CLOUD_PENDING_START_KEY]=pending;setJobState_(patch);clearDashboardCache_();
+  }finally{lock.releaseLock();}
+  try{return {ok:true,pendingStart:pending,...githubDispatch_(workerCount,maxMunicipalitiesPerWorker,maxMinutes)};}
+  catch(err){const patch={};patch[CLOUD_PENDING_START_KEY]='';setJobState_(patch);clearDashboardCache_();throw err;}
 }
 
 function doGet(e){
