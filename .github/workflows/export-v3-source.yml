@@ -48,6 +48,8 @@ jobs:
           cp findmyink-collector/main/services/database.js exported/main/services/
           cp findmyink-collector/main/services/municipalities.js exported/main/services/
           cp findmyink-collector/main/services/sheets.js exported/main/services/
+          cp -R findmyink-collector/main/utils exported/main/
+          if [ -d findmyink-collector/tests ]; then cp -R findmyink-collector/tests exported/; fi
           cp findmyink-collector/package.json exported/
 
       - name: Upload scraper sources
