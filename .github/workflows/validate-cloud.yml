@@ -66,3 +66,19 @@ jobs:
       - name: Existing V3 tests
         working-directory: findmyink-collector
         run: npm test
+
+      - name: Electron CI smoke
+        working-directory: findmyink-collector
+        shell: bash
+        run: |
+          cat > electron-smoke.cjs <<'JS'
+          const { app, BrowserWindow } = require('electron');
+          app.whenReady().then(() => {
+            const win = new BrowserWindow({ show: false, webPreferences: { sandbox: false } });
+            console.log('electron-ci-smoke-ok');
+            win.destroy();
+            app.quit();
+          });
+          JS
+          xvfb-run -a npx electron --no-sandbox --disable-setuid-sandbox electron-smoke.cjs
+          rm -f electron-smoke.cjs
