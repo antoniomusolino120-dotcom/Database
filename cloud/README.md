@@ -1,31 +1,29 @@
 # FindMyInk Cloud Collector
 
-Cloud execution layer for the verified V3.2 collector.
+Il collector cloud usa il Google Sheet come fonte autorevole della coda.
 
-## Authoritative queue
+## Regole della coda
 
-The Google Sheet tab `COMUNI` is authoritative:
+- `COMUNI!G` usa solo `TODO` o `COMPLETED`.
+- `COMUNI!L` viene valorizzata solo dopo una scansione completa e finalizzata.
+- Un comune interrotto resta `TODO`.
+- Il `Municipality ID` è la chiave logica.
 
-- column G: `TODO` / `COMPLETED`
-- column L: timestamp of the last fully completed scan
-- no `PARTIAL` state is used in cloud mode
+## Parallelismo
 
-A failed/interrupted municipality remains `TODO`; column L is not changed. The next run restarts that municipality from the beginning.
+Il workflow può avviare 3 o 5 Chromium in parallelo. Ogni worker riceve uno shard deterministico dei comuni `TODO`.
 
-## Parallelism
+I worker **non scrivono in MASTER** e non marcano i comuni come `COMPLETED`. Raccolgono soltanto candidati in artifact separati.
 
-The GitHub Actions workflow supports 3 or 5 workers. Each Municipality ID is deterministically assigned to one shard, so workers from the same workflow do not process the same municipality.
+## Deduplica
 
-A workflow-level concurrency group prevents two collector runs from running at the same time.
+La deduplica è divisa in due livelli:
 
-## Deduplication
+1. **Pre-click** nei worker: usa Maps Key / Maps URL già presenti in `MASTER` per evitare di aprire schede note.
+2. **Finale unica**: un solo job `finalize`, dopo tutti i worker, scarica tutti gli artifact, confronta insieme i candidati dei 3/5 motori con `MASTER`, deduplica per Maps Key, Maps URL, telefono, nome+indirizzo e nome+dominio, quindi applica il risultato.
 
-Before opening a Google Maps place card the worker derives the same Maps key used by the V3 engine and checks it against the current `MASTER` index. Known links are skipped immediately. A second, locked server-side deduplication is performed before every MASTER insert/update for correctness across workers.
+Apps Script usa un lock soltanto come protezione atomica durante la scrittura finale. La decisione finale di deduplica è indipendente dal numero di browser.
 
-## Required configuration
+## Secret richiesto
 
-Repository Actions secret:
-
-`SHEET_ENDPOINT` = deployed Apps Script Web App `/exec` URL for `apps-script/Code.gs`.
-
-After updating `Code.gs`, deploy a new Web App version before starting the cloud collector.
+`SHEET_ENDPOINT` = URL completo del deployment Apps Script (`.../macros/s/.../exec`).
