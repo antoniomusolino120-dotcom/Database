@@ -6,11 +6,11 @@ on:
       workers:
         description: 'Browser paralleli'
         required: true
-        default: '3'
+        default: '10'
         type: choice
-        options: ['3','5']
+        options: ['5','10']
       max_minutes:
-        description: 'Durata massima per worker (max 330)'
+        description: 'Durata raccolta prima della chiusura sicura (max 330)'
         required: true
         default: '300'
         type: string
@@ -36,10 +36,10 @@ jobs:
       - id: matrix
         shell: bash
         run: |
-          if [ "${{ inputs.workers }}" = "5" ]; then
-            echo 'workers={"worker":[0,1,2,3,4]}' >> "$GITHUB_OUTPUT"
+          if [ "${{ inputs.workers }}" = "10" ]; then
+            echo 'workers={"worker":[0,1,2,3,4,5,6,7,8,9]}' >> "$GITHUB_OUTPUT"
           else
-            echo 'workers={"worker":[0,1,2]}' >> "$GITHUB_OUTPUT"
+            echo 'workers={"worker":[0,1,2,3,4]}' >> "$GITHUB_OUTPUT"
           fi
 
   init:
@@ -49,6 +49,7 @@ jobs:
       SHEET_ENDPOINT: ${{ secrets.SHEET_ENDPOINT }}
       RUN_ID: ${{ github.run_id }}
       WORKER_COUNT: ${{ inputs.workers }}
+      MAX_MINUTES: ${{ inputs.max_minutes }}
     steps:
       - name: Start and verify central queue
         shell: bash
@@ -58,7 +59,12 @@ jobs:
 
           start_payload=$(python3 - <<'PY'
           import json, os
-          print(json.dumps({"action":"startCloudRun","runId":os.environ["RUN_ID"],"workerCount":int(os.environ["WORKER_COUNT"])}))
+          print(json.dumps({
+              "action":"startCloudRun",
+              "runId":os.environ["RUN_ID"],
+              "workerCount":int(os.environ["WORKER_COUNT"]),
+              "maxMinutes":int(os.environ["MAX_MINUTES"])
+          }))
           PY
           )
           verify_payload='{"action":"getCloudDashboardState","previewTimes":{}}'
@@ -100,9 +106,6 @@ jobs:
               exit 0
             fi
 
-            # Apps Script can execute the POST and then return a transient 404/empty
-            # response on the redirect. Verify the authoritative state before retrying
-            # the mutating start request.
             verify=$(curl --silent --show-error --location --connect-timeout 15 --max-time 45 \
               -H 'Content-Type: text/plain;charset=utf-8' \
               --data-binary "$verify_payload" \
@@ -127,12 +130,14 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      max-parallel: 10
       matrix: ${{ fromJSON(needs.matrix.outputs.workers) }}
     env:
       SHEET_ENDPOINT: ${{ secrets.SHEET_ENDPOINT }}
       RUN_ID: ${{ github.run_id }}
       WORKER_INDEX: ${{ matrix.worker }}
       WORKER_COUNT: ${{ inputs.workers }}
+      WORKER_GENERATION: '1'
       MAX_MINUTES: ${{ inputs.max_minutes }}
       MAX_MUNICIPALITIES_PER_WORKER: ${{ inputs.max_municipalities_per_worker }}
       LEASE_SECONDS: '900'
@@ -200,6 +205,7 @@ jobs:
     needs: [matrix, init, worker]
     if: ${{ always() && needs.init.result == 'success' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       SHEET_ENDPOINT: ${{ secrets.SHEET_ENDPOINT }}
       RUN_ID: ${{ github.run_id }}
@@ -224,28 +230,20 @@ jobs:
           except Exception:
               sys.exit(1)
           run=data.get('run') or {}
-          terminal={'STOPPED','INCOMPLETE','COMPLETED','COMPLETED_WITH_ERRORS'}
+          terminal={'PAUSED','STOPPED','INCOMPLETE','COMPLETED','COMPLETED_WITH_ERRORS'}
           ok=data.get('ok') is True and str(run.get('runId','')) == os.environ['RUN_ID'] and run.get('status') in terminal
           sys.exit(0 if ok else 1)
           PY
           }
 
-          for attempt in $(seq 1 10); do
+          for attempt in $(seq 1 60); do
             response=$(curl --silent --show-error --location --connect-timeout 15 --max-time 75 \
               -H 'Content-Type: text/plain;charset=utf-8' \
               --data-binary "$payload" \
               "$SHEET_ENDPOINT" 2>curl-close.err || true)
 
-            RESPONSE="$response" python3 - <<'PY'
-          import json, sys, os
-          try:
-              data=json.loads(os.environ.get('RESPONSE',''))
-          except Exception:
-              sys.exit(1)
-          sys.exit(0 if data.get('ok') is True else 1)
-          PY
-            if [ $? -eq 0 ]; then
-              echo "Run close acknowledged."
+            if closed_state "$response"; then
+              echo "Run close acknowledged and all workers are ready."
               exit 0
             fi
 
@@ -257,10 +255,10 @@ jobs:
               echo "Run was closed despite a transient bridge response error."
               exit 0
             fi
-            sleep $((attempt * 2))
+            sleep 10
           done
 
-          echo 'Unable to close or verify the run state.'
+          echo 'Run is still waiting for worker cleanup; leaving it blocked instead of falsely marking it ready.'
           test -s curl-close.err && cat curl-close.err || true
           test -s curl-close-verify.err && cat curl-close-verify.err || true
           exit 1
