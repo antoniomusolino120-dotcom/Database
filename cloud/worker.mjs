@@ -13,7 +13,8 @@ app.disableHardwareAcceleration();
 const ENDPOINT=String(process.env.SHEET_ENDPOINT||'').trim();
 const RUN_ID=String(process.env.RUN_ID||process.env.GITHUB_RUN_ID||Date.now());
 const WORKER_INDEX=Number(process.env.WORKER_INDEX||0);
-const WORKER_COUNT=Number(process.env.WORKER_COUNT||3);
+const WORKER_COUNT=Number(process.env.WORKER_COUNT||10);
+const WORKER_GENERATION=Math.max(1,Number(process.env.WORKER_GENERATION||1));
 const MAX_MINUTES=Math.min(330,Math.max(5,Number(process.env.MAX_MINUTES||300)));
 const OUTPUT_PATH=String(process.env.OUTPUT_PATH||path.join('cloud-output',`worker-${WORKER_INDEX}.json`));
 const PREVIEW_INTERVAL_MS=Math.max(30000,Number(process.env.PREVIEW_INTERVAL_MS||60000));
@@ -30,10 +31,11 @@ const SETTINGS={
   maxScrollsPerQuery:Number(process.env.MAX_SCROLLS_PER_QUERY||60),
 };
 
-const state={version:4,runId:RUN_ID,workerIndex:WORKER_INDEX,workerCount:WORKER_COUNT,startedAt:new Date().toISOString(),finishedAt:null,municipalities:[],errors:[]};
-const log=(event,meta={})=>console.log(JSON.stringify({ts:new Date().toISOString(),runId:RUN_ID,worker:WORKER_INDEX,event,...meta}));
+const state={version:5,runId:RUN_ID,workerIndex:WORKER_INDEX,workerCount:WORKER_COUNT,generation:WORKER_GENERATION,startedAt:new Date().toISOString(),deadlineAt:null,finishedAt:null,municipalities:[],errors:[]};
+const log=(event,meta={})=>console.log(JSON.stringify({ts:new Date().toISOString(),runId:RUN_ID,worker:WORKER_INDEX,generation:WORKER_GENERATION,event,...meta}));
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-let lastHeartbeat=0,lastPreview=0,stopRequested=false,completedByWorker=0,ambiguousClaimCount=0;
+let lastHeartbeat=0,lastPreview=0,stopRequested=false,drainReason='',closeReason='COMPLETE',completedByWorker=0,ambiguousClaimCount=0;
+let centralDeadlineMs=0,hardDeadlineMs=0,deadlineTimer=null,previewTimer=null,previewStartTimer=null,previewInFlight=false;
 
 async function persist(){await fs.mkdir(path.dirname(OUTPUT_PATH),{recursive:true});await fs.writeFile(OUTPUT_PATH,JSON.stringify(state,null,2));}
 
@@ -68,14 +70,29 @@ function normalizeMapsUrl(url=''){
   catch{return String(url||'').split('?')[0].replace(/\/$/,'');}
 }
 function isTattoo(item){const hay=`${item?.name||''} ${item?.address||''} ${item?.website||''}`.toLowerCase();return /tattoo|tatu|tatou|ink/.test(hay);}
+function closingStatus(){return drainReason==='PAUSE'?'PAUSING':drainReason==='TIME_LIMIT'?'CLOSING':'STOPPING';}
+function closingPhase(base=''){const prefix=drainReason==='PAUSE'?'PAUSA RICHIESTA':drainReason==='TIME_LIMIT'?'CHIUSURA 5H':'ARRESTO RICHIESTO';return base?`${prefix} · ${base}`:prefix;}
 
-async function heartbeat(extra={},force=false){
+function applyControl(response){
+  if(response?.stale){stopRequested=true;closeReason='STALE';return;}
+  const command=String(response?.command||'').toUpperCase();
+  if(command==='STOP'||response?.stopRequested){stopRequested=true;closeReason='STOP';return;}
+  if(command==='PAUSE'&&!drainReason){drainReason='PAUSE';closeReason='PAUSE';log('pause-requested');}
+  if(command==='TIME_LIMIT'&&!drainReason){drainReason='TIME_LIMIT';closeReason='TIME_LIMIT';log('time-limit-requested');}
+}
+
+async function heartbeat(extra={},force=false,critical=false){
   const age=Date.now()-lastHeartbeat;
-  if((!force&&age<HEARTBEAT_INTERVAL_MS)||(force&&age<5000))return !stopRequested;
+  if(!critical&&((!force&&age<HEARTBEAT_INTERVAL_MS)||(force&&age<5000)))return !stopRequested;
   lastHeartbeat=Date.now();
+  const outgoing={...extra};
+  if(drainReason&&!stopRequested){
+    outgoing.status=closingStatus();
+    outgoing.phase=closingPhase(outgoing.phase||'TERMINO COMUNE');
+  }
   try{
-    const r=await sheet('heartbeatCloudWorker',{runId:RUN_ID,workerIndex:WORKER_INDEX,leaseSeconds:LEASE_SECONDS,state:extra},3);
-    stopRequested=Boolean(r.stopRequested);
+    const r=await sheet('heartbeatCloudWorker',{runId:RUN_ID,workerIndex:WORKER_INDEX,generation:WORKER_GENERATION,leaseSeconds:LEASE_SECONDS,state:outgoing},3);
+    applyControl(r);
   }catch(err){log('heartbeat-error',{error:err.message});}
   return !stopRequested;
 }
@@ -84,15 +101,44 @@ async function preview(browser,force=false){
   if(!force&&Date.now()-lastPreview<PREVIEW_INTERVAL_MS)return;
   lastPreview=Date.now();
   try{
-    const win=browser.window;
+    const win=browser?.window;
     if(!win||win.isDestroyed())return;
     const image=await win.webContents.capturePage();
     let jpeg=image.resize({width:360}).toJPEG(35);
     if(jpeg.length>65000)jpeg=image.resize({width:300}).toJPEG(25);
     const base64=jpeg.toString('base64');
     if(base64.length>90000){log('preview-skipped',{bytes:jpeg.length});return;}
-    await sheet('updateCloudPreview',{runId:RUN_ID,workerIndex:WORKER_INDEX,capturedAt:new Date().toISOString(),base64},1);
+    await sheet('updateCloudPreview',{runId:RUN_ID,workerIndex:WORKER_INDEX,generation:WORKER_GENERATION,capturedAt:new Date().toISOString(),base64},1);
   }catch(err){log('preview-error',{error:err.message});}
+}
+
+function stopPreviewLoop(){
+  if(previewStartTimer){clearTimeout(previewStartTimer);previewStartTimer=null;}
+  if(previewTimer){clearInterval(previewTimer);previewTimer=null;}
+}
+function startPreviewLoop(browser){
+  stopPreviewLoop();
+  const offset=Math.min(PREVIEW_INTERVAL_MS-5000,5000+(WORKER_INDEX%10)*5000);
+  const capture=()=>{
+    if(previewInFlight)return;
+    previewInFlight=true;
+    preview(browser,true).catch(()=>{}).finally(()=>{previewInFlight=false;});
+  };
+  previewStartTimer=setTimeout(()=>{
+    capture();
+    previewTimer=setInterval(capture,PREVIEW_INTERVAL_MS);
+  },Math.max(1000,offset));
+}
+
+function scheduleDeadline(){
+  if(deadlineTimer)clearTimeout(deadlineTimer);
+  const wait=Math.max(0,centralDeadlineMs-Date.now());
+  deadlineTimer=setTimeout(()=>{
+    if(stopRequested||drainReason)return;
+    drainReason='TIME_LIMIT';closeReason='TIME_LIMIT';
+    log('time-limit-reached',{deadlineAt:state.deadlineAt});
+    void heartbeat({status:'CLOSING',phase:'LIMITE 5H · TERMINO COMUNE'},true,true);
+  },wait);
 }
 
 async function refreshKnownIndex(knownKeys,knownUrls){
@@ -103,10 +149,10 @@ async function refreshKnownIndex(knownKeys,knownUrls){
   log('dedup-index-loaded',{keys:knownKeys.size,urls:knownUrls.size});
 }
 
-async function finishWorker(required=false){
+async function finishWorker(required=false,reason=closeReason){
   let lastError=null;
   try{
-    const result=await sheet('finishCloudWorker',{runId:RUN_ID,workerIndex:WORKER_INDEX},6);
+    const result=await sheet('finishCloudWorker',{runId:RUN_ID,workerIndex:WORKER_INDEX,generation:WORKER_GENERATION,reason},6);
     if(result?.stale)throw new Error(`finishCloudWorker stale: ${result.status||'UNKNOWN'}`);
     return result;
   }catch(err){
@@ -117,7 +163,7 @@ async function finishWorker(required=false){
   try{
     const dashboard=await sheet('getCloudDashboardState',{previewTimes:{}},3);
     const worker=(dashboard.workers||[]).find(w=>Number(w?.workerIndex)===WORKER_INDEX);
-    if(worker&&String(worker.runId||'')===RUN_ID&&String(worker.status||'')==='DONE'){
+    if(worker&&String(worker.runId||'')===RUN_ID&&Number(worker.generation||1)===WORKER_GENERATION&&['DONE','READY'].includes(String(worker.status||''))){
       log('finish-worker-verified',{status:worker.status});
       return {verified:true,status:worker.status};
     }
@@ -131,24 +177,43 @@ async function finishWorker(required=false){
 }
 
 async function run(){
-  if(!Number.isInteger(WORKER_INDEX)||WORKER_INDEX<0||!Number.isInteger(WORKER_COUNT)||![3,5].includes(WORKER_COUNT)||WORKER_INDEX>=WORKER_COUNT)throw new Error(`Worker non valido: ${WORKER_INDEX}/${WORKER_COUNT}`);
+  if(!Number.isInteger(WORKER_INDEX)||WORKER_INDEX<0||!Number.isInteger(WORKER_COUNT)||![5,10].includes(WORKER_COUNT)||WORKER_INDEX>=WORKER_COUNT)throw new Error(`Worker non valido: ${WORKER_INDEX}/${WORKER_COUNT}`);
   if(!QUERIES.length)throw new Error('Nessuna query Maps configurata');
 
   await app.whenReady();
-  const browser=new MapsBrowserCollector(path.join(os.tmpdir(),`fmi-cloud-${RUN_ID}-${WORKER_INDEX}`),e=>log(`browser:${e.type||'event'}`,e));
-  const deadline=Date.now()+MAX_MINUTES*60_000;
+  const dashboard=await sheet('getCloudDashboardState',{previewTimes:{}},6);
+  const runState=dashboard.run||{};
+  if(String(runState.runId||'')!==RUN_ID)throw new Error('Run cloud non più autorevole');
+  const authoritativeWorker=(dashboard.workers||[]).find(w=>Number(w?.workerIndex)===WORKER_INDEX);
+  if(authoritativeWorker&&Number(authoritativeWorker.generation||1)!==WORKER_GENERATION)throw new Error('Generazione worker non più autorevole');
+  centralDeadlineMs=Date.parse(runState.deadlineAt||'')||Date.now()+MAX_MINUTES*60_000;
+  hardDeadlineMs=centralDeadlineMs+30*60_000;
+  state.deadlineAt=new Date(centralDeadlineMs).toISOString();
+  if(Date.now()>=centralDeadlineMs){
+    closeReason='TIME_LIMIT';drainReason='TIME_LIMIT';
+    await persist();
+    await finishWorker(true,'TIME_LIMIT');
+    return;
+  }
+  scheduleDeadline();
+
+  const browser=new MapsBrowserCollector(path.join(os.tmpdir(),`fmi-cloud-${RUN_ID}-${WORKER_INDEX}-g${WORKER_GENERATION}`),e=>log(`browser:${e.type||'event'}`,e));
   const knownKeys=new Set(),knownUrls=new Set();
   let municipalitiesSinceRefresh=999;
 
   try{
     await refreshKnownIndex(knownKeys,knownUrls);
     await browser.open();
-    await heartbeat({status:'IDLE',phase:'PRONTO',found:0,newCount:0,duplicates:0,foreign:0},true);
-    await preview(browser,true);
+    startPreviewLoop(browser);
+    await heartbeat({status:'IDLE',phase:'PRONTO',found:0,newCount:0,duplicates:0,foreign:0},true,true);
 
-    while(Date.now()<deadline&&!stopRequested&&(MAX_MUNICIPALITIES_PER_WORKER===0||completedByWorker<MAX_MUNICIPALITIES_PER_WORKER)){
-      const claim=await sheet('claimCloudMunicipality',{runId:RUN_ID,workerIndex:WORKER_INDEX,leaseSeconds:LEASE_SECONDS},6);
-      if(claim.stopped){stopRequested=true;break;}
+    while(!stopRequested&&(MAX_MUNICIPALITIES_PER_WORKER===0||completedByWorker<MAX_MUNICIPALITIES_PER_WORKER)){
+      if(drainReason)break;
+      if(Date.now()>=centralDeadlineMs){drainReason='TIME_LIMIT';closeReason='TIME_LIMIT';break;}
+
+      const claim=await sheet('claimCloudMunicipality',{runId:RUN_ID,workerIndex:WORKER_INDEX,generation:WORKER_GENERATION,leaseSeconds:LEASE_SECONDS},6);
+      applyControl(claim);
+      if(claim.stopped||stopRequested||drainReason)break;
       if(claim.retry){
         ambiguousClaimCount=0;
         const wait=Math.max(1500,Math.min(15000,Number(claim.retryAfterMs)||5000));
@@ -159,7 +224,7 @@ async function run(){
       const municipality=claim.row;
       if(!municipality){
         if(claim.queueExhausted===true){
-          ambiguousClaimCount=0;
+          ambiguousClaimCount=0;closeReason='QUEUE_COMPLETE';
           log('queue-empty',{queueExhausted:true});
           break;
         }
@@ -180,23 +245,23 @@ async function run(){
       let found=0,preDuplicates=0,foreign=0;
       const candidates=[],seenThisMunicipality=new Set();
       log('municipality-start',{queueCode:municipality.queueCode,municipalityId:municipality.municipalityId,name:municipality.name,claimToken:municipality.claimToken});
-      await heartbeat({status:'WORKING',municipalityId:String(municipality.municipalityId),municipalityName:municipality.name,queueCode:municipality.queueCode,phase:'AVVIO COMUNE',query:'',found:0,newCount:0,duplicates:0,foreign:0},true);
+      await heartbeat({status:'WORKING',municipalityId:String(municipality.municipalityId),municipalityName:municipality.name,queueCode:municipality.queueCode,phase:'AVVIO COMUNE',query:'',found:0,newCount:0,duplicates:0,foreign:0},true,true);
 
       try{
-        for(const variant of QUERIES){
-          if(Date.now()>=deadline)throw new Error('__TIME_LIMIT__');
-          if(!(await heartbeat({status:'WORKING',phase:'RICERCA',query:variant,found,newCount:0,duplicates:preDuplicates,foreign},true)))throw new Error('__STOP__');
+        for(let qi=0;qi<QUERIES.length;qi++){
+          if(Date.now()>=hardDeadlineMs)throw new Error('__HARD_LIMIT__');
+          const variant=QUERIES[qi];
+          if(!(await heartbeat({status:'WORKING',phase:`RICERCA ${qi+1}/${QUERIES.length}`,query:variant,found,newCount:candidates.length,duplicates:preDuplicates,foreign},true)))throw new Error('__STOP__');
 
           const query=buildMunicipalityQuery(variant,municipality);
-          await heartbeat({phase:'RICERCA MAPS',query},true);
+          await heartbeat({status:'WORKING',phase:`RICERCA MAPS · ${qi+1}/${QUERIES.length}`,query,found,newCount:candidates.length,duplicates:preDuplicates,foreign},true);
           const search=await browser.collectLinks(query,SETTINGS);
-          await preview(browser);
           if(search.verification)throw new Error('GOOGLE_VERIFICATION_REQUIRED');
           const links=search.links||[];found+=links.length;
           log('query-links',{queueCode:municipality.queueCode,query,count:links.length});
 
           for(let ri=0;ri<links.length;ri++){
-            if(Date.now()>=deadline)throw new Error('__TIME_LIMIT__');
+            if(Date.now()>=hardDeadlineMs)throw new Error('__HARD_LIMIT__');
             if(stopRequested)throw new Error('__STOP__');
             const link=links[ri],key=linkKey(link),compactUrl=normalizeMapsUrl(link),fingerprint=key||compactUrl;
 
@@ -206,11 +271,10 @@ async function run(){
             if(fingerprint)seenThisMunicipality.add(fingerprint);
 
             if(ri%8===0){
-              const alive=await heartbeat({status:'WORKING',phase:'APERTURA SCHEDE',query,found,newCount:candidates.length,duplicates:preDuplicates,foreign});
+              const alive=await heartbeat({status:'WORKING',phase:`ANALISI SCHEDE · ${Math.min(ri+1,links.length)}/${links.length}`,query,found,newCount:candidates.length,duplicates:preDuplicates,foreign});
               if(!alive)throw new Error('__STOP__');
             }
             const candidate=await browser.extractPlace(link,SETTINGS);
-            await preview(browser);
             if(candidate.verification)throw new Error('GOOGLE_VERIFICATION_REQUIRED');
             if(!candidate.name||!isTattoo(candidate))continue;
             if(isExplicitForeign(candidate.address)||isClearlyOutsideItaly(candidate)){foreign++;continue;}
@@ -224,6 +288,7 @@ async function run(){
         const finalized=await sheet('finalizeCloudMunicipality',{
           runId:RUN_ID,
           workerIndex:WORKER_INDEX,
+          generation:WORKER_GENERATION,
           municipalityId:String(municipality.municipalityId),
           claimToken:String(municipality.claimToken||''),
           claimSheetRow:Number(municipality.sheetRow)||0,
@@ -246,17 +311,19 @@ async function run(){
         });
         await persist();
         log('municipality-complete',{queueCode:municipality.queueCode,found,newCount:finalized.inserted,duplicates:finalized.duplicates,foreign,replayed:Boolean(finalized.alreadyFinalized)});
-        await heartbeat({status:'IDLE',phase:'COMUNE COMPLETATO',query:'',found,newCount:Number(finalized.inserted)||0,duplicates:Number(finalized.duplicates)||0,foreign},true);
+        await heartbeat({status:'IDLE',phase:'COMUNE COMPLETATO',query:'',found,newCount:Number(finalized.inserted)||0,duplicates:Number(finalized.duplicates)||0,foreign},true,true);
       }catch(err){
         const code=err?.message||String(err);
-        if(code==='__STOP__'||code==='__TIME_LIMIT__'){
-          log(code==='__STOP__'?'stop-requested':'time-limit',{queueCode:municipality.queueCode});
+        if(code==='__STOP__'||code==='__HARD_LIMIT__'){
+          if(code==='__HARD_LIMIT__'){drainReason='TIME_LIMIT';closeReason='TIME_LIMIT';}
+          log(code==='__STOP__'?'stop-requested':'hard-time-limit',{queueCode:municipality.queueCode});
           break;
         }
         try{
           await sheet('failCloudMunicipality',{
             runId:RUN_ID,
             workerIndex:WORKER_INDEX,
+            generation:WORKER_GENERATION,
             municipalityId:String(municipality.municipalityId),
             claimToken:String(municipality.claimToken||''),
             claimSheetRow:Number(municipality.sheetRow)||0,
@@ -266,21 +333,24 @@ async function run(){
         state.errors.push({queueCode:municipality.queueCode,municipalityId:String(municipality.municipalityId),error:code});
         await persist();
         log('municipality-error',{queueCode:municipality.queueCode,error:code});
-        if(code==='GOOGLE_VERIFICATION_REQUIRED')break;
+        if(code==='GOOGLE_VERIFICATION_REQUIRED'){closeReason='ERROR';break;}
       }
     }
   }finally{
-    await preview(browser,true).catch(()=>{});
+    if(deadlineTimer){clearTimeout(deadlineTimer);deadlineTimer=null;}
+    stopPreviewLoop();
+    const phase=closeReason==='PAUSE'?'PAUSA · CHIUSURA CHROMIUM':closeReason==='TIME_LIMIT'?'5H RAGGIUNTE · CHIUSURA CHROMIUM':closeReason==='STOP'?'ARRESTO · CHIUSURA CHROMIUM':'CHIUSURA CHROMIUM';
+    await heartbeat({status:closeReason==='PAUSE'?'PAUSING':'STOPPING',phase,query:''},true,true).catch(()=>{});
     await browser.close().catch(()=>{});
     state.finishedAt=new Date().toISOString();await persist();
-    await finishWorker(true);
-    log('worker-done',{municipalities:state.municipalities.length,completedByWorker,limit:MAX_MUNICIPALITIES_PER_WORKER,errors:state.errors.length,stopped:stopRequested});
+    await finishWorker(true,closeReason);
+    log('worker-done',{municipalities:state.municipalities.length,completedByWorker,limit:MAX_MUNICIPALITIES_PER_WORKER,errors:state.errors.length,stopped:stopRequested,drainReason,closeReason});
   }
 }
 
 run().then(()=>app.quit()).catch(async err=>{
   state.errors.push({municipalityId:'',error:err?.message||String(err)});state.finishedAt=new Date().toISOString();
   await persist().catch(()=>{});
-  await finishWorker(false);
+  await finishWorker(false,'ERROR');
   console.error(err?.stack||err);app.exit(1);
 });
