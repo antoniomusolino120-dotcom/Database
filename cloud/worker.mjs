@@ -103,9 +103,31 @@ async function refreshKnownIndex(knownKeys,knownUrls){
   log('dedup-index-loaded',{keys:knownKeys.size,urls:knownUrls.size});
 }
 
-async function finishWorker(){
-  try{return await sheet('finishCloudWorker',{runId:RUN_ID,workerIndex:WORKER_INDEX},6);}
-  catch(err){log('finish-worker-error',{error:err?.message||String(err)});return null;}
+async function finishWorker(required=false){
+  let lastError=null;
+  try{
+    const result=await sheet('finishCloudWorker',{runId:RUN_ID,workerIndex:WORKER_INDEX},6);
+    if(result?.stale)throw new Error(`finishCloudWorker stale: ${result.status||'UNKNOWN'}`);
+    return result;
+  }catch(err){
+    lastError=err;
+    log('finish-worker-error',{error:err?.message||String(err)});
+  }
+
+  try{
+    const dashboard=await sheet('getCloudDashboardState',{previewTimes:{}},3);
+    const worker=(dashboard.workers||[]).find(w=>Number(w?.workerIndex)===WORKER_INDEX);
+    if(worker&&String(worker.runId||'')===RUN_ID&&String(worker.status||'')==='DONE'){
+      log('finish-worker-verified',{status:worker.status});
+      return {verified:true,status:worker.status};
+    }
+  }catch(err){
+    lastError=lastError||err;
+    log('finish-worker-verify-error',{error:err?.message||String(err)});
+  }
+
+  if(required)throw lastError||new Error('Chiusura worker non confermata dal bridge');
+  return null;
 }
 
 async function run(){
@@ -251,7 +273,7 @@ async function run(){
     await preview(browser,true).catch(()=>{});
     await browser.close().catch(()=>{});
     state.finishedAt=new Date().toISOString();await persist();
-    await finishWorker();
+    await finishWorker(true);
     log('worker-done',{municipalities:state.municipalities.length,completedByWorker,limit:MAX_MUNICIPALITIES_PER_WORKER,errors:state.errors.length,stopped:stopRequested});
   }
 }
@@ -259,6 +281,6 @@ async function run(){
 run().then(()=>app.quit()).catch(async err=>{
   state.errors.push({municipalityId:'',error:err?.message||String(err)});state.finishedAt=new Date().toISOString();
   await persist().catch(()=>{});
-  await finishWorker();
+  await finishWorker(false);
   console.error(err?.stack||err);app.exit(1);
 });
