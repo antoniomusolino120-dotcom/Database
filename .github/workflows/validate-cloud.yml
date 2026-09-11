@@ -8,6 +8,7 @@ on:
       - 'apps-script/Code.gs'
       - 'apps-script/dashboard.html'
       - '.github/workflows/cloud-collector.yml'
+      - '.github/workflows/cloud-worker-restart.yml'
       - '.github/workflows/validate-cloud.yml'
   pull_request:
     branches: [main]
@@ -16,6 +17,7 @@ on:
       - 'apps-script/Code.gs'
       - 'apps-script/dashboard.html'
       - '.github/workflows/cloud-collector.yml'
+      - '.github/workflows/cloud-worker-restart.yml'
       - '.github/workflows/validate-cloud.yml'
 
 permissions:
@@ -58,10 +60,36 @@ jobs:
           node --check findmyink-collector/cloud/italy-filter.mjs
           cp apps-script/Code.gs /tmp/database-code.js
           node --check /tmp/database-code.js
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          html=Path('apps-script/dashboard.html').read_text()
+          scripts=re.findall(r'<script(?:\s[^>]*)?>(.*?)</script>',html,flags=re.S|re.I)
+          if not scripts:
+              raise SystemExit('dashboard script non trovato')
+          Path('/tmp/dashboard.js').write_text('\n'.join(scripts))
+          PY
+          node --check /tmp/dashboard.js
+
+      - name: Workflow structure checks
+        shell: bash
+        run: |
+          ruby -e "require 'yaml'; YAML.load_file('.github/workflows/cloud-collector.yml'); YAML.load_file('.github/workflows/cloud-worker-restart.yml')"
+          python3 - <<'PY'
+          from pathlib import Path
+          main=Path('.github/workflows/cloud-collector.yml').read_text()
+          restart=Path('.github/workflows/cloud-worker-restart.yml').read_text()
+          required_main=["options: ['5','10']",'0,1,2,3,4,5,6,7,8,9','WORKER_GENERATION','max-parallel: 10']
+          required_restart=['run_id:','worker_index:','generation:','WORKER_GENERATION']
+          for needle in required_main:
+              if needle not in main: raise SystemExit('cloud-collector manca: '+needle)
+          for needle in required_restart:
+              if needle not in restart: raise SystemExit('cloud-worker-restart manca: '+needle)
+          PY
 
       - name: Cloud safety tests
         working-directory: findmyink-collector
-        run: node --test cloud/dedup.test.mjs cloud/apps-script-dedup.test.mjs cloud/italy-filter.test.mjs
+        run: node --test cloud/dedup.test.mjs cloud/apps-script-dedup.test.mjs cloud/apps-script-orchestration.test.mjs cloud/italy-filter.test.mjs
 
       - name: Setup Node
         uses: actions/setup-node@v4
