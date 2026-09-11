@@ -1,0 +1,110 @@
+name: Database Cloud Worker Restart
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Run cloud esistente'
+        required: true
+        type: string
+      worker_index:
+        description: 'Indice worker 0-9'
+        required: true
+        type: string
+      worker_count:
+        description: 'Numero worker del run'
+        required: true
+        type: string
+      generation:
+        description: 'Generazione autorevole del worker'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: database-cloud-worker-${{ inputs.run_id }}-${{ inputs.worker_index }}
+  cancel-in-progress: false
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      SHEET_ENDPOINT: ${{ secrets.SHEET_ENDPOINT }}
+      RUN_ID: ${{ inputs.run_id }}
+      WORKER_INDEX: ${{ inputs.worker_index }}
+      WORKER_COUNT: ${{ inputs.worker_count }}
+      WORKER_GENERATION: ${{ inputs.generation }}
+      MAX_MINUTES: '330'
+      MAX_MUNICIPALITIES_PER_WORKER: '0'
+      LEASE_SECONDS: '900'
+      HEARTBEAT_INTERVAL_MS: '30000'
+      PREVIEW_INTERVAL_MS: '60000'
+      OUTPUT_PATH: cloud-output/worker-${{ inputs.worker_index }}-g${{ inputs.generation }}.json
+      ELECTRON_DISABLE_SECURITY_WARNINGS: 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Require Sheet bridge
+        shell: bash
+        run: test -n "$SHEET_ENDPOINT" || (echo 'Missing repository secret SHEET_ENDPOINT' && exit 1)
+
+      - name: Reconstruct verified V3.2 engine
+        shell: bash
+        run: |
+          BASE_COMMIT="edc8c985e9e2f6e9bc205e24889ff2169dd696cd"
+          git fetch --depth=1 origin "$BASE_COMMIT"
+          mkdir -p /tmp/fmi-v3-parts
+          for n in 00 01 02 03 04; do
+            git show "$BASE_COMMIT:.bootstrap/source.part${n}.b64" > "/tmp/fmi-v3-parts/source.part${n}.b64"
+          done
+          python3 - <<'PY'
+          import base64, pathlib
+          parts=[pathlib.Path(f'/tmp/fmi-v3-parts/source.part{i:02d}.b64').read_bytes() for i in range(5)]
+          if len(parts[3]) == 8999:
+              parts[3] = parts[3][:2408] + b'n' + parts[3][2408:]
+          pathlib.Path('source.zip').write_bytes(base64.b64decode(b''.join(parts), validate=True))
+          PY
+          echo "a98699a516c7f07cc553075d40d595691cced918c4cf71b90c53d8c450dd119c  source.zip" | sha256sum -c -
+          unzip -q source.zip
+          python3 .hotfix/patch_v32.py
+          cp -R cloud findmyink-collector/cloud
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Electron dependencies
+        working-directory: findmyink-collector
+        run: npm install
+
+      - name: Run restarted worker
+        working-directory: findmyink-collector
+        shell: bash
+        run: xvfb-run -a npx electron --no-sandbox --disable-setuid-sandbox cloud/worker.mjs
+
+      - name: Upload worker diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-worker-${{ inputs.worker_index }}-g${{ inputs.generation }}
+          path: findmyink-collector/cloud-output/worker-${{ inputs.worker_index }}-g${{ inputs.generation }}.json
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Reconcile run state
+        if: always()
+        shell: bash
+        run: |
+          payload=$(python3 - <<'PY'
+          import json, os
+          print(json.dumps({"action":"closeCloudRun","runId":os.environ["RUN_ID"],"workflowResult":"success"}))
+          PY
+          )
+          curl --silent --show-error --location --connect-timeout 15 --max-time 60 \
+            -H 'Content-Type: text/plain;charset=utf-8' \
+            --data-binary "$payload" "$SHEET_ENDPOINT" || true
