@@ -3,20 +3,31 @@ FINDMYINK CLOUD COLLECTOR — SETUP APPS SCRIPT
 1. Apri il Google Sheet master.
 2. Estensioni > Apps Script.
 3. Sostituisci Code.gs con `apps-script/Code.gs`.
-4. Aggiungi un file HTML chiamato esattamente `dashboard` e incolla `apps-script/dashboard.html`.
-5. Distribuisci > Nuova distribuzione > Applicazione web.
+4. Aggiungi/aggiorna il file HTML chiamato esattamente `dashboard` con `apps-script/dashboard.html`.
+5. Distribuisci > Gestisci distribuzioni > Modifica la distribuzione web esistente e crea una nuova versione.
 6. Esegui come: Me.
 7. Accesso: Chiunque.
-8. Distribuisci e copia l'URL che termina in /exec.
-9. In GitHub > repository Database > Settings > Secrets and variables > Actions crea:
+8. Mantieni/copia l'URL che termina in /exec.
+9. In GitHub > repository Database > Settings > Secrets and variables > Actions verifica:
    SHEET_ENDPOINT = URL /exec completo.
 10. Apri la console:
     <URL /exec>?dashboard=1
-11. Per avviare il collector usa GitHub Actions > FindMyInk Cloud Collector e scegli 3 o 5 browser.
+11. Dalla console puoi avviare 5 o 10 Chromium. La modalità completa usa un limite centrale di 5 ore.
+
+CONTROLLI:
+- PAUSA globale: ogni worker termina in sicurezza il comune corrente, chiude Chromium e passa a READY.
+- STOP globale: richiede l'arresto sicuro di tutti i worker.
+- PAUSA/STOP sulla card: agiscono solo sul singolo worker.
+- RILANCIA: avvia una nuova generazione dello stesso worker senza interrompere gli altri.
+- AVVIA resta disabilitato finché tutti i worker del run precedente non sono DONE / READY / OFFLINE.
+- Allo scadere delle 5 ore non vengono assegnati nuovi comuni; i worker in corso entrano in CHIUSURA e completano in sicurezza il lavoro corrente.
 
 REGOLE:
 - COMUNI colonna G: solo TODO / COMPLETED.
 - COMUNI colonna L: data solo dopo finalizzazione completa.
 - I worker fanno claim dinamici: non possono lavorare sullo stesso comune mentre il lease è attivo.
+- Ogni rilancio incrementa la generazione del worker: una vecchia istanza che tornasse viva non può più finalizzare o aggiornare lo stato.
 - La deduplica finale è una sola e centralizzata nel bridge Apps Script.
-- Le preview Chromium sono temporanee in CacheService e non vengono salvate nello Sheet.
+- Le 5 query Maps restano sempre attive: tattoo, tatuatore, tattoo studio, studio tatuaggi, tattoo artist.
+- Le preview Chromium sono leggere, sfalsate tra i worker e temporanee in CacheService; non vengono salvate nello Sheet.
+- La dashboard mostra timer, fase, ping, generazione e attività recenti di ogni worker.
