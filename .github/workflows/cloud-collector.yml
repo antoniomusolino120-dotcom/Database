@@ -22,6 +22,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: database-cloud-scraper
@@ -262,3 +263,138 @@ jobs:
           test -s curl-close.err && cat curl-close.err || true
           test -s curl-close-verify.err && cat curl-close-verify.err || true
           exit 1
+
+  auto-restart:
+    needs: [close]
+    if: ${{ always() && needs.close.result == 'success' && inputs.max_minutes == '300' && inputs.max_municipalities_per_worker == '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      SHEET_ENDPOINT: ${{ secrets.SHEET_ENDPOINT }}
+      RUN_ID: ${{ github.run_id }}
+      WORKER_COUNT: ${{ inputs.workers }}
+      MAX_MINUTES: ${{ inputs.max_minutes }}
+      MAX_MUNICIPALITIES_PER_WORKER: ${{ inputs.max_municipalities_per_worker }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Verify timed run is eligible for restart
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          payload='{"action":"getCloudDashboardState","previewTimes":{}}'
+          curl --fail-with-body --silent --show-error --location --connect-timeout 15 --max-time 75 \
+            -H 'Content-Type: text/plain;charset=utf-8' \
+            --data-binary "$payload" \
+            "$SHEET_ENDPOINT" > /tmp/cloud-state.json
+
+          restart=$(python3 - <<'PY'
+          import json, os
+          from datetime import datetime, timezone
+
+          data=json.load(open('/tmp/cloud-state.json'))
+          run=data.get('run') or {}
+          console=data.get('console') or {}
+          totals=data.get('totals') or run.get('totals') or {}
+
+          def parse_iso(value):
+              value=str(value or '').strip()
+              if not value:
+                  return None
+              try:
+                  return datetime.fromisoformat(value.replace('Z','+00:00'))
+              except Exception:
+                  return None
+
+          deadline=parse_iso(run.get('deadlineAt'))
+          expired=bool(deadline and datetime.now(timezone.utc) >= deadline)
+          same_run=str(run.get('runId','')) == os.environ['RUN_ID']
+          status=str(run.get('status','')).upper()
+          control=str(run.get('control','')).upper()
+          stopped=bool(run.get('stopRequested'))
+          ready=console.get('readyForStart') is True
+          todo=int(totals.get('todo') or 0)
+          eligible=(
+              data.get('ok') is True and same_run and status == 'INCOMPLETE' and
+              expired and not control and not stopped and ready and todo > 0
+          )
+          print('true' if eligible else 'false')
+          PY
+          )
+          echo "restart=$restart" >> "$GITHUB_OUTPUT"
+          if [ "$restart" = "true" ]; then
+            echo 'Run da 300 minuti terminato, worker tutti fermi e coda ancora aperta.'
+          else
+            echo 'Nessun autorilancio: run non scaduto, fermato/pausato, sostituito o coda completata.'
+          fi
+
+      - name: Five minute cooldown
+        if: ${{ steps.gate.outputs.restart == 'true' }}
+        shell: bash
+        run: |
+          echo 'Tutti i worker sono fermi. Attendo 5 minuti prima del nuovo ciclo.'
+          sleep 300
+
+      - name: Recheck and dispatch next cycle
+        if: ${{ steps.gate.outputs.restart == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          payload='{"action":"getCloudDashboardState","previewTimes":{}}'
+          curl --fail-with-body --silent --show-error --location --connect-timeout 15 --max-time 75 \
+            -H 'Content-Type: text/plain;charset=utf-8' \
+            --data-binary "$payload" \
+            "$SHEET_ENDPOINT" > /tmp/cloud-state-after-cooldown.json
+
+          restart=$(python3 - <<'PY'
+          import json, os
+          data=json.load(open('/tmp/cloud-state-after-cooldown.json'))
+          run=data.get('run') or {}
+          console=data.get('console') or {}
+          totals=data.get('totals') or run.get('totals') or {}
+          same_run=str(run.get('runId','')) == os.environ['RUN_ID']
+          status=str(run.get('status','')).upper()
+          control=str(run.get('control','')).upper()
+          stopped=bool(run.get('stopRequested'))
+          ready=console.get('readyForStart') is True
+          todo=int(totals.get('todo') or 0)
+          eligible=(data.get('ok') is True and same_run and status == 'INCOMPLETE' and not control and not stopped and ready and todo > 0)
+          print('true' if eligible else 'false')
+          PY
+          )
+
+          if [ "$restart" != "true" ]; then
+            echo 'Autorilancio annullato durante i 5 minuti: lo stato del sistema è cambiato.'
+            exit 0
+          fi
+
+          dispatch_payload=$(python3 - <<'PY'
+          import json, os
+          print(json.dumps({
+              'ref':'main',
+              'inputs':{
+                  'workers':str(os.environ['WORKER_COUNT']),
+                  'max_minutes':str(os.environ['MAX_MINUTES']),
+                  'max_municipalities_per_worker':str(os.environ['MAX_MUNICIPALITIES_PER_WORKER'])
+              }
+          }))
+          PY
+          )
+
+          http_code=$(curl --silent --show-error --location \
+            --output /tmp/dispatch-response.txt \
+            --write-out '%{http_code}' \
+            --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --header 'Content-Type: application/json' \
+            --data-binary "$dispatch_payload" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/cloud-collector.yml/dispatches")
+
+          if [ "$http_code" != "204" ]; then
+            echo "Autorilancio GitHub fallito: HTTP $http_code"
+            cat /tmp/dispatch-response.txt || true
+            exit 1
+          fi
+          echo 'Nuovo ciclo da 300 minuti accodato automaticamente.'
