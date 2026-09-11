@@ -2,7 +2,7 @@ name: Validate Cloud Collector
 
 on:
   push:
-    branches: [collector-shared-queue-cloud, main, cloud-10-workers-control]
+    branches: [collector-shared-queue-cloud, main]
     paths:
       - 'cloud/**'
       - 'apps-script/Code.gs'
@@ -74,6 +74,7 @@ jobs:
       - name: Workflow structure checks
         shell: bash
         run: |
+          ruby -e "require 'yaml'; YAML.load_file('.github/workflows/cloud-collector.yml'); YAML.load_file('.github/workflows/cloud-worker-restart.yml')"
           python3 - <<'PY'
           from pathlib import Path
           main=Path('.github/workflows/cloud-collector.yml').read_text()
