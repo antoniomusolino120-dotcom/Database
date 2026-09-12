@@ -127,7 +127,7 @@ jobs:
 
   worker:
     needs: [matrix, init]
-    timeout-minutes: 355
+    timeout-minutes: 330
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -201,6 +201,119 @@ jobs:
           path: findmyink-collector/cloud-output/worker-${{ matrix.worker }}.json
           if-no-files-found: warn
           retention-days: 1
+
+  watchdog:
+    needs: [init]
+    if: ${{ needs.init.result == 'success' && inputs.max_municipalities_per_worker == '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    env:
+      SHEET_ENDPOINT: ${{ secrets.SHEET_ENDPOINT }}
+      RUN_ID: ${{ github.run_id }}
+    steps:
+      - name: Relaunch each stalled worker once
+        shell: bash
+        run: |
+          set -u
+          test -n "$SHEET_ENDPOINT" || (echo 'Missing repository secret SHEET_ENDPOINT' && exit 1)
+          state_payload='{"action":"getCloudDashboardState","previewTimes":{}}'
+
+          while true; do
+            response=$(curl --silent --show-error --location --connect-timeout 15 --max-time 45 \
+              -H 'Content-Type: text/plain;charset=utf-8' \
+              --data-binary "$state_payload" \
+              "$SHEET_ENDPOINT" 2>watchdog-state.err || true)
+
+            decision=$(RESPONSE="$response" python3 - <<'PY'
+          import json, os
+          from datetime import datetime, timezone
+
+          try:
+              data=json.loads(os.environ.get('RESPONSE',''))
+          except Exception:
+              print('RETRY')
+              raise SystemExit
+
+          run=data.get('run') or {}
+          if data.get('ok') is not True or str(run.get('runId','')) != os.environ['RUN_ID']:
+              print('STOP')
+              raise SystemExit
+
+          status=str(run.get('status','')).upper()
+          control=str(run.get('control','')).upper()
+          if status != 'RUNNING' or control or bool(run.get('stopRequested')):
+              print('STOP')
+              raise SystemExit
+
+          deadline=str(run.get('deadlineAt') or '').strip()
+          if deadline:
+              try:
+                  when=datetime.fromisoformat(deadline.replace('Z','+00:00'))
+                  if datetime.now(timezone.utc) >= when:
+                      print('STOP')
+                      raise SystemExit
+              except ValueError:
+                  pass
+
+          stalled=[]
+          for worker in data.get('workers') or []:
+              if str(worker.get('runId','')) != os.environ['RUN_ID']:
+                  continue
+              if str(worker.get('status','')).upper() != 'STALLED':
+                  continue
+              if int(worker.get('generation') or 1) != 1:
+                  continue
+              idx=worker.get('workerIndex')
+              try:
+                  idx=int(idx)
+              except Exception:
+                  continue
+              if idx >= 0:
+                  stalled.append(idx)
+          print(','.join(str(i) for i in sorted(set(stalled))) or 'NONE')
+          PY
+            )
+
+            if [ "$decision" = "STOP" ]; then
+              echo 'Watchdog terminato: run non più attivo o limite raggiunto.'
+              exit 0
+            fi
+            if [ "$decision" = "RETRY" ]; then
+              echo 'Watchdog: stato temporaneamente non leggibile, riprovo.'
+              sleep 60
+              continue
+            fi
+
+            if [ "$decision" != "NONE" ]; then
+              IFS=',' read -r -a stalled <<< "$decision"
+              for worker_index in "${stalled[@]}"; do
+                restart_payload=$(WORKER_INDEX="$worker_index" python3 - <<'PY'
+          import json, os
+          print(json.dumps({"action":"restartCloudWorker","workerIndex":int(os.environ["WORKER_INDEX"])}))
+          PY
+                )
+                restart_response=$(curl --silent --show-error --location --connect-timeout 15 --max-time 75 \
+                  -H 'Content-Type: text/plain;charset=utf-8' \
+                  --data-binary "$restart_payload" \
+                  "$SHEET_ENDPOINT" 2>watchdog-restart.err || true)
+                RESULT="$restart_response" WORKER_INDEX="$worker_index" python3 - <<'PY'
+          import json, os
+          idx=int(os.environ['WORKER_INDEX'])+1
+          try:
+              data=json.loads(os.environ.get('RESULT',''))
+          except Exception:
+              print(f'Worker {idx}: risposta rilancio non leggibile; il prossimo controllo verificherà lo stato.')
+              raise SystemExit
+          if data.get('ok') is True:
+              print(f'Worker {idx}: rilancio automatico richiesto (unico tentativo).')
+          else:
+              print(f'Worker {idx}: rilancio automatico fallito: {data.get("error","errore sconosciuto")}')
+          PY
+              done
+            fi
+
+            sleep 60
+          done
 
   close:
     needs: [matrix, init, worker]
