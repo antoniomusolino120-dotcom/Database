@@ -147,6 +147,24 @@ function blockingWorkers_(run,stateMap){
   return out;
 }
 
+function stalledWorkersClosePatch_(run,stateMap,nowMs){
+  const result={patch:{},recovered:[]},deadline=Date.parse(run&&run.deadlineAt||'')||0;
+  if(!run||!run.runId||!deadline||nowMs<deadline)return result;
+  const count=Math.max(0,Math.min(CLOUD_MAX_WORKERS,Number(run.workerCount)||0));
+  for(let i=0;i<count;i++){
+    const key=workerKey_(i),worker=(stateMap||{})[key];
+    if(!worker||String(worker.runId||'')!==String(run.runId)||isTerminalWorkerStatus_(worker.status)||!workerIsStalled_(worker,nowMs))continue;
+    let recovered=Object.assign({},worker,{
+      status:'DONE',control:'',municipalityId:'',municipalityName:'',queueCode:'',
+      phase:'LEASE SCADUTA · RECUPERATO',query:'',leaseUntil:null,lastSeen:new Date(nowMs).toISOString(),
+      claimToken:'',claimSheetRow:0
+    });
+    recovered=workerEvent_(recovered,recovered.phase,'Comune incompleto mantenuto in coda');
+    result.patch[key]=recovered;result.recovered.push(i);stateMap[key]=recovered;
+  }
+  return result;
+}
+
 function normalizedMapsUrl_(url){return String(url||'').trim().split('#')[0].split('?')[0].replace(/\/$/,'');}
 function normalizedPhone_(phone){
   const raw=String(phone??'').trim();
@@ -385,15 +403,16 @@ function closeCloudRun_(data){
   const runId=String(data.runId||'').trim(),lock=LockService.getScriptLock();lock.waitLock(10000);
   try{
     const map=getJobStateMap_(),run=map[CLOUD_RUN_KEY];if(!run||String(run.runId)!==runId)return {status:'STALE'};
+    const recovery=stalledWorkersClosePatch_(run,map,Date.now());if(recovery.recovered.length)setJobState_(recovery.patch);
     let allTerminal=true;for(let i=0;i<Number(run.workerCount||0);i++){const w=map[workerKey_(i)];if(!w||String(w.runId||'')!==runId||!isTerminalWorkerStatus_(w.status))allTerminal=false;}
-    if(!allTerminal){clearDashboardCache_();return {status:run.status||'RUNNING',waiting:true,blockingWorkers:blockingWorkers_(run,map)};}
+    if(!allTerminal){clearDashboardCache_();return {status:run.status||'RUNNING',waiting:true,blockingWorkers:blockingWorkers_(run,map),recoveredWorkers:recovery.recovered};}
     const totals=computeCloudTotals_();run.totals=totals;run.finishedAt=run.finishedAt||nowIso_();run.updatedAt=nowIso_();const workflowResult=String(data.workflowResult||'').toLowerCase(),control=String(run.control||'').toUpperCase();
     if(control==='PAUSE')run.status='PAUSED';
     else if(control==='STOP'||run.stopRequested)run.status='STOPPED';
     else if(workflowResult&&workflowResult!=='success')run.status='INCOMPLETE';
     else if(totals.todo>0)run.status='INCOMPLETE';
     else run.status=totals.errors>0?'COMPLETED_WITH_ERRORS':'COMPLETED';
-    const p={};p[CLOUD_RUN_KEY]=run;setJobState_(p);clearDashboardCache_();return {status:run.status,totals,ready:true};
+    const p={};p[CLOUD_RUN_KEY]=run;setJobState_(p);clearDashboardCache_();return {status:run.status,totals,ready:true,recoveredWorkers:recovery.recovered};
   }finally{lock.releaseLock();}
 }
 
