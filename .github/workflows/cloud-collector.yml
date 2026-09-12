@@ -71,10 +71,10 @@ jobs:
           verify_payload='{"action":"getCloudDashboardState","previewTimes":{}}'
 
           valid_start() {
-            RESPONSE="$1" python3 - <<'PY'
+            FILE="$1" python3 - <<'PY'
           import json, os, sys
           try:
-              data=json.loads(os.environ.get('RESPONSE',''))
+              data=json.load(open(os.environ['FILE']))
           except Exception:
               sys.exit(1)
           ok=data.get('ok') is True and str(data.get('runId','')) == os.environ['RUN_ID'] and data.get('status') == 'RUNNING'
@@ -83,10 +83,10 @@ jobs:
           }
 
           valid_state() {
-            RESPONSE="$1" python3 - <<'PY'
+            FILE="$1" python3 - <<'PY'
           import json, os, sys
           try:
-              data=json.loads(os.environ.get('RESPONSE',''))
+              data=json.load(open(os.environ['FILE']))
           except Exception:
               sys.exit(1)
           run=data.get('run') or {}
@@ -97,23 +97,23 @@ jobs:
 
           for attempt in $(seq 1 12); do
             echo "Apps Script init attempt $attempt/12"
-            response=$(curl --silent --show-error --location --connect-timeout 15 --max-time 75 \
+            curl --silent --show-error --location --connect-timeout 15 --max-time 75 \
               -H 'Content-Type: text/plain;charset=utf-8' \
               --data-binary "$start_payload" \
-              "$SHEET_ENDPOINT" 2>curl-start.err || true)
+              "$SHEET_ENDPOINT" > /tmp/start-response.json 2>curl-start.err || true
 
-            if valid_start "$response"; then
-              echo "Central queue started and acknowledged."
+            if valid_start /tmp/start-response.json; then
+              echo 'Central queue started and acknowledged.'
               exit 0
             fi
 
-            verify=$(curl --silent --show-error --location --connect-timeout 15 --max-time 45 \
+            curl --silent --show-error --location --connect-timeout 15 --max-time 45 \
               -H 'Content-Type: text/plain;charset=utf-8' \
               --data-binary "$verify_payload" \
-              "$SHEET_ENDPOINT" 2>curl-verify.err || true)
+              "$SHEET_ENDPOINT" > /tmp/start-verify.json 2>curl-verify.err || true
 
-            if valid_state "$verify"; then
-              echo "Central queue was started despite a transient bridge response error."
+            if valid_state /tmp/start-verify.json; then
+              echo 'Central queue was started despite a transient bridge response error.'
               exit 0
             fi
 
@@ -142,8 +142,8 @@ jobs:
       MAX_MINUTES: ${{ inputs.max_minutes }}
       MAX_MUNICIPALITIES_PER_WORKER: ${{ inputs.max_municipalities_per_worker }}
       LEASE_SECONDS: '900'
-      HEARTBEAT_INTERVAL_MS: '30000'
-      PREVIEW_INTERVAL_MS: '60000'
+      HEARTBEAT_INTERVAL_MS: '60000'
+      PREVIEW_INTERVAL_MS: '120000'
       OUTPUT_PATH: cloud-output/worker-${{ matrix.worker }}.json
       ELECTRON_DISABLE_SECURITY_WARNINGS: 'true'
     steps:
@@ -191,7 +191,7 @@ jobs:
       - name: Run dynamic cloud worker
         working-directory: findmyink-collector
         shell: bash
-        run: xvfb-run -a npx electron --no-sandbox --disable-setuid-sandbox cloud/worker.mjs
+        run: xvfb-run -a npx electron --no-sandbox --disable-setuid-sandbox cloud/worker-bridge-resilience.mjs
 
       - name: Upload worker diagnostics
         if: always()
@@ -211,28 +211,49 @@ jobs:
       SHEET_ENDPOINT: ${{ secrets.SHEET_ENDPOINT }}
       RUN_ID: ${{ github.run_id }}
     steps:
-      - name: Relaunch each stalled worker once
+      - name: Relaunch each failed worker once
         shell: bash
         run: |
           set -u
           test -n "$SHEET_ENDPOINT" || (echo 'Missing repository secret SHEET_ENDPOINT' && exit 1)
-          state_payload='{"action":"getCloudDashboardState","previewTimes":{}}'
+          echo '{}' > /tmp/watchdog-preview-times.json
 
           while true; do
-            response=$(curl --silent --show-error --location --connect-timeout 15 --max-time 45 \
+            state_payload=$(python3 - <<'PY'
+          import json
+          try:
+              times=json.load(open('/tmp/watchdog-preview-times.json'))
+          except Exception:
+              times={}
+          print(json.dumps({'action':'getCloudDashboardState','previewTimes':times}))
+          PY
+            )
+
+            curl --silent --show-error --location --connect-timeout 15 --max-time 45 \
               -H 'Content-Type: text/plain;charset=utf-8' \
               --data-binary "$state_payload" \
-              "$SHEET_ENDPOINT" 2>watchdog-state.err || true)
+              "$SHEET_ENDPOINT" > /tmp/watchdog-state.json 2>watchdog-state.err || true
 
-            decision=$(RESPONSE="$response" python3 - <<'PY'
+            decision=$(python3 - <<'PY'
           import json, os
           from datetime import datetime, timezone
 
           try:
-              data=json.loads(os.environ.get('RESPONSE',''))
+              data=json.load(open('/tmp/watchdog-state.json'))
           except Exception:
               print('RETRY')
               raise SystemExit
+
+          times={}
+          for worker in data.get('workers') or []:
+              idx=worker.get('workerIndex')
+              at=worker.get('previewAt')
+              if idx is not None and at:
+                  times[str(idx)]=str(at)
+          try:
+              json.dump(times,open('/tmp/watchdog-preview-times.json','w'))
+          except Exception:
+              pass
 
           run=data.get('run') or {}
           if data.get('ok') is not True or str(run.get('runId','')) != os.environ['RUN_ID']:
@@ -255,52 +276,56 @@ jobs:
               except ValueError:
                   pass
 
-          stalled=[]
+          failed=[]
           for worker in data.get('workers') or []:
               if str(worker.get('runId','')) != os.environ['RUN_ID']:
                   continue
-              if str(worker.get('status','')).upper() != 'STALLED':
-                  continue
               if int(worker.get('generation') or 1) != 1:
                   continue
-              idx=worker.get('workerIndex')
+              worker_status=str(worker.get('status','')).upper()
+              phase=str(worker.get('phase','')).upper()
+              is_failed=(worker_status == 'STALLED') or (worker_status == 'DONE' and ('ERRORE' in phase or 'ERROR' in phase))
+              if not is_failed:
+                  continue
               try:
-                  idx=int(idx)
+                  idx=int(worker.get('workerIndex'))
               except Exception:
                   continue
               if idx >= 0:
-                  stalled.append(idx)
-          print(','.join(str(i) for i in sorted(set(stalled))) or 'NONE')
+                  failed.append(idx)
+          print(','.join(str(i) for i in sorted(set(failed))) or 'NONE')
           PY
             )
 
-            if [ "$decision" = "STOP" ]; then
+            if [ "$decision" = 'STOP' ]; then
               echo 'Watchdog terminato: run non più attivo o limite raggiunto.'
               exit 0
             fi
-            if [ "$decision" = "RETRY" ]; then
+            if [ "$decision" = 'RETRY' ]; then
               echo 'Watchdog: stato temporaneamente non leggibile, riprovo.'
               sleep 60
               continue
             fi
 
-            if [ "$decision" != "NONE" ]; then
-              IFS=',' read -r -a stalled <<< "$decision"
-              for worker_index in "${stalled[@]}"; do
+            if [ "$decision" != 'NONE' ]; then
+              IFS=',' read -r -a failed <<< "$decision"
+              for worker_index in "${failed[@]}"; do
                 restart_payload=$(WORKER_INDEX="$worker_index" python3 - <<'PY'
           import json, os
-          print(json.dumps({"action":"restartCloudWorker","workerIndex":int(os.environ["WORKER_INDEX"])}))
+          print(json.dumps({'action':'restartCloudWorker','workerIndex':int(os.environ['WORKER_INDEX'])}))
           PY
                 )
-                restart_response=$(curl --silent --show-error --location --connect-timeout 15 --max-time 75 \
+
+                curl --silent --show-error --location --connect-timeout 15 --max-time 75 \
                   -H 'Content-Type: text/plain;charset=utf-8' \
                   --data-binary "$restart_payload" \
-                  "$SHEET_ENDPOINT" 2>watchdog-restart.err || true)
-                RESULT="$restart_response" WORKER_INDEX="$worker_index" python3 - <<'PY'
+                  "$SHEET_ENDPOINT" > /tmp/watchdog-restart.json 2>watchdog-restart.err || true
+
+                WORKER_INDEX="$worker_index" python3 - <<'PY'
           import json, os
           idx=int(os.environ['WORKER_INDEX'])+1
           try:
-              data=json.loads(os.environ.get('RESULT',''))
+              data=json.load(open('/tmp/watchdog-restart.json'))
           except Exception:
               print(f'Worker {idx}: risposta rilancio non leggibile; il prossimo controllo verificherà lo stato.')
               raise SystemExit
@@ -316,7 +341,7 @@ jobs:
           done
 
   close:
-    needs: [matrix, init, worker]
+    needs: [matrix, init, worker, watchdog]
     if: ${{ always() && needs.init.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -331,16 +356,16 @@ jobs:
           set -u
           payload=$(python3 - <<'PY'
           import json, os
-          print(json.dumps({"action":"closeCloudRun","runId":os.environ["RUN_ID"],"workflowResult":os.environ.get("WORKFLOW_RESULT","")}))
+          print(json.dumps({'action':'closeCloudRun','runId':os.environ['RUN_ID'],'workflowResult':os.environ.get('WORKFLOW_RESULT','')}))
           PY
           )
           verify_payload='{"action":"getCloudDashboardState","previewTimes":{}}'
 
           closed_state() {
-            RESPONSE="$1" python3 - <<'PY'
+            FILE="$1" python3 - <<'PY'
           import json, os, sys
           try:
-              data=json.loads(os.environ.get('RESPONSE',''))
+              data=json.load(open(os.environ['FILE']))
           except Exception:
               sys.exit(1)
           run=data.get('run') or {}
@@ -351,22 +376,23 @@ jobs:
           }
 
           for attempt in $(seq 1 60); do
-            response=$(curl --silent --show-error --location --connect-timeout 15 --max-time 75 \
+            curl --silent --show-error --location --connect-timeout 15 --max-time 75 \
               -H 'Content-Type: text/plain;charset=utf-8' \
               --data-binary "$payload" \
-              "$SHEET_ENDPOINT" 2>curl-close.err || true)
+              "$SHEET_ENDPOINT" > /tmp/close-response.json 2>curl-close.err || true
 
-            if closed_state "$response"; then
-              echo "Run close acknowledged and all workers are ready."
+            if closed_state /tmp/close-response.json; then
+              echo 'Run close acknowledged and all workers are ready.'
               exit 0
             fi
 
-            verify=$(curl --silent --show-error --location --connect-timeout 15 --max-time 45 \
+            curl --silent --show-error --location --connect-timeout 15 --max-time 45 \
               -H 'Content-Type: text/plain;charset=utf-8' \
               --data-binary "$verify_payload" \
-              "$SHEET_ENDPOINT" 2>curl-close-verify.err || true)
-            if closed_state "$verify"; then
-              echo "Run was closed despite a transient bridge response error."
+              "$SHEET_ENDPOINT" > /tmp/close-verify.json 2>curl-close-verify.err || true
+
+            if closed_state /tmp/close-verify.json; then
+              echo 'Run was closed despite a transient bridge response error.'
               exit 0
             fi
             sleep 10
@@ -404,7 +430,6 @@ jobs:
           restart=$(python3 - <<'PY'
           import json, os
           from datetime import datetime, timezone
-
           data=json.load(open('/tmp/cloud-state.json'))
           run=data.get('run') or {}
           console=data.get('console') or {}
@@ -427,15 +452,12 @@ jobs:
           stopped=bool(run.get('stopRequested'))
           ready=console.get('readyForStart') is True
           todo=int(totals.get('todo') or 0)
-          eligible=(
-              data.get('ok') is True and same_run and status == 'INCOMPLETE' and
-              expired and not control and not stopped and ready and todo > 0
-          )
+          eligible=(data.get('ok') is True and same_run and status == 'INCOMPLETE' and expired and not control and not stopped and ready and todo > 0)
           print('true' if eligible else 'false')
           PY
           )
           echo "restart=$restart" >> "$GITHUB_OUTPUT"
-          if [ "$restart" = "true" ]; then
+          if [ "$restart" = 'true' ]; then
             echo 'Run da 300 minuti terminato, worker tutti fermi e coda ancora aperta.'
           else
             echo 'Nessun autorilancio: run non scaduto, fermato/pausato, sostituito o coda completata.'
@@ -476,7 +498,7 @@ jobs:
           PY
           )
 
-          if [ "$restart" != "true" ]; then
+          if [ "$restart" != 'true' ]; then
             echo 'Autorilancio annullato durante i 5 minuti: lo stato del sistema è cambiato.'
             exit 0
           fi
@@ -505,7 +527,7 @@ jobs:
             --data-binary "$dispatch_payload" \
             "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/cloud-collector.yml/dispatches")
 
-          if [ "$http_code" != "204" ]; then
+          if [ "$http_code" != '204' ]; then
             echo "Autorilancio GitHub fallito: HTTP $http_code"
             cat /tmp/dispatch-response.txt || true
             exit 1
