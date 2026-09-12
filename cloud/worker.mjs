@@ -9,6 +9,9 @@ import { isExplicitForeign } from '../main/utils/location.js';
 import { isClearlyOutsideItaly } from './italy-filter.mjs';
 
 app.disableHardwareAcceleration();
+// In CI the scraper owns the only BrowserWindow. Keep Electron alive after it closes
+// so finishCloudWorker can persist DONE/READY before the process exits explicitly.
+app.on('window-all-closed',()=>{});
 
 const ENDPOINT=String(process.env.SHEET_ENDPOINT||'').trim();
 const RUN_ID=String(process.env.RUN_ID||process.env.GITHUB_RUN_ID||Date.now());
