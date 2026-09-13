@@ -7,6 +7,9 @@ const BATCH_SIZE = Math.max(25, Math.min(200, Number(process.env.BATCH_SIZE || 1
 const SUT_URL = 'https://raw.githubusercontent.com/aborruso/archivioDatiPubbliciPreziosi/36f99cc057ebef653b44c8ba8b921e8b81a656bc/docs/sistemaUnicoTerritoriale/comuniSistemaUnicoTerritoriale.csv';
 const AUX_URL = 'https://raw.githubusercontent.com/opendatasicilia/comuni-italiani/af99645c2f83d5734e7aca526f2c0355a5c0fef8/dati/comuni.csv';
 const PROVINCES_URL = 'https://raw.githubusercontent.com/samuelefrasca/Province-Italia/1ac4373fffef58c97754d5fb5e68ade3b336a271/data/province.json';
+const PROVINCE_CODE_ALIASES = new Map([
+  ['CI', 'SU'], // legacy Carbonia-Iglesias -> current Sulcis Iglesiente
+]);
 
 function parseCsv(text) {
   const rows = [];
@@ -27,13 +30,17 @@ function parseCsv(text) {
 }
 
 async function fetchText(url) {
-  const res = await fetch(url, { headers: { 'user-agent': 'Database municipality repair/1.1' } });
+  const res = await fetch(url, { headers: { 'user-agent': 'Database municipality repair/1.2' } });
   if (!res.ok) throw new Error(`Fetch ${url} -> HTTP ${res.status}`);
   return res.text();
 }
 
 function clean(v) { return String(v ?? '').trim(); }
 function upper(v) { return clean(v).toLocaleUpperCase('it-IT'); }
+function currentProvinceCode(v) {
+  const code = upper(v);
+  return PROVINCE_CODE_ALIASES.get(code) || code;
+}
 
 function parseSut(text) {
   const csv = parseCsv(text);
@@ -50,7 +57,8 @@ function parseSut(text) {
   return csv.map(r => ({
     nr: Number(r[iNr]),
     sourceName: clean(r[iName]),
-    provinceCode: upper(r[iSigla]),
+    sourceProvinceCode: upper(r[iSigla]),
+    provinceCode: currentProvinceCode(r[iSigla]),
     municipalityId: clean(r[iIstat]).padStart(6, '0'),
   }));
 }
@@ -110,7 +118,7 @@ function assertSource(rows) {
   }
   const expect = (nr, id, name, sigla) => {
     const r = rows[nr - 1];
-    if (!r || r.municipalityId !== id || upper(r.sourceName) !== upper(name) || r.provinceCode !== sigla) {
+    if (!r || r.municipalityId !== id || upper(r.sourceName) !== upper(name) || r.sourceProvinceCode !== sigla) {
       throw new Error(`Controllo fonte fallito NR ${nr}: ${JSON.stringify(r)}`);
     }
   };
