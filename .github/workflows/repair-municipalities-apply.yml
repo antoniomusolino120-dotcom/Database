@@ -19,7 +19,7 @@ jobs:
     env:
       SHEET_ENDPOINT: ${{ secrets.SHEET_ENDPOINT }}
       APPLY: '1'
-      START_NR: '1790'
+      START_NR: '1'
       BATCH_SIZE: '100'
     steps:
       - uses: actions/checkout@v4
@@ -28,5 +28,5 @@ jobs:
           node-version: 22
       - name: Require Sheet bridge
         run: test -n "$SHEET_ENDPOINT" || (echo 'Missing repository secret SHEET_ENDPOINT' && exit 1)
-      - name: Validate and rebuild municipality suffix
+      - name: Validate and rebuild municipality list
         run: node cloud/repair-municipalities.mjs
