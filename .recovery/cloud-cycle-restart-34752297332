@@ -1,0 +1,2 @@
+Bootstrap one-time recovery for cloud run 34752297332 after the five-hour cycle auto-restart gate skipped its cooldown.
+Future cycles are handled by cloud-cycle-restart-resilient.yml via workflow_run.

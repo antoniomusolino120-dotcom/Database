@@ -1,0 +1,285 @@
+name: Database Cloud Cycle Auto-Restart Resilient
+
+on:
+  workflow_run:
+    workflows: ['Database Cloud Scraper']
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Run cloud precedente da verificare'
+        required: true
+        type: string
+  push:
+    paths:
+      - '.recovery/cloud-cycle-restart-34752297332'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: database-cloud-cycle-restart-${{ github.event.workflow_run.id || inputs.run_id || '34752297332' }}
+  cancel-in-progress: false
+
+jobs:
+  cycle-restart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SHEET_ENDPOINT: ${{ secrets.SHEET_ENDPOINT }}
+      TARGET_RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id || '34752297332' }}
+      GH_TOKEN: ${{ github.token }}
+      COOLDOWN_SECONDS: '310'
+    steps:
+      - name: Verify stable terminal state and dispatch next cycle
+        shell: bash
+        run: |
+          set -u
+          test -n "$SHEET_ENDPOINT" || (echo 'Missing repository secret SHEET_ENDPOINT' && exit 1)
+          test -n "$TARGET_RUN_ID" || (echo 'Missing TARGET_RUN_ID' && exit 1)
+          echo "Cycle recovery for run $TARGET_RUN_ID"
+
+          state_payload='{"action":"getCloudDashboardState","previewTimes":{}}'
+
+          active_newer_collector() {
+            curl --silent --show-error --location --connect-timeout 15 --max-time 45 \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/cloud-collector.yml/runs?event=workflow_dispatch&per_page=20" \
+              > /tmp/cloud-collector-runs.json 2>/tmp/cloud-collector-runs.err || return 1
+
+            TARGET_RUN_ID="$TARGET_RUN_ID" python3 - <<'PY'
+          import json, os, sys
+          try:
+              data=json.load(open('/tmp/cloud-collector-runs.json'))
+          except Exception:
+              sys.exit(1)
+          try:
+              target=int(os.environ['TARGET_RUN_ID'])
+          except Exception:
+              sys.exit(1)
+          active=[]
+          for run in data.get('workflow_runs') or []:
+              try:
+                  rid=int(run.get('id') or 0)
+              except Exception:
+                  continue
+              status=str(run.get('status') or '').lower()
+              if rid > target and status != 'completed':
+                  active.append((rid,status))
+          if active:
+              active.sort()
+              rid,status=active[-1]
+              print(f'Nuovo ciclo già presente su GitHub: run {rid} · {status}')
+              sys.exit(0)
+          sys.exit(2)
+          PY
+          }
+
+          for attempt in $(seq 1 30); do
+            echo "State check $attempt/30"
+            curl --silent --show-error --location --connect-timeout 15 --max-time 45 \
+              -H 'Content-Type: text/plain;charset=utf-8' \
+              --data-binary "$state_payload" \
+              "$SHEET_ENDPOINT" > /tmp/cloud-cycle-state.json 2>/tmp/cloud-cycle-state.err || true
+
+            decision=$(TARGET_RUN_ID="$TARGET_RUN_ID" COOLDOWN_SECONDS="$COOLDOWN_SECONDS" python3 - <<'PY'
+          import json, os, sys
+          from datetime import datetime, timezone
+
+          def parse_iso(value):
+              value=str(value or '').strip()
+              if not value:
+                  return None
+              try:
+                  return datetime.fromisoformat(value.replace('Z','+00:00'))
+              except Exception:
+                  return None
+
+          try:
+              data=json.load(open('/tmp/cloud-cycle-state.json'))
+          except Exception:
+              print('RETRY')
+              print('Diagnostica: risposta bridge non leggibile', file=sys.stderr)
+              raise SystemExit
+
+          if data.get('ok') is not True:
+              print('RETRY')
+              print('Diagnostica: bridge ok != true', file=sys.stderr)
+              raise SystemExit
+
+          target=str(os.environ['TARGET_RUN_ID'])
+          run=data.get('run') or {}
+          current=str(run.get('runId') or '')
+          status=str(run.get('status') or '').upper()
+          control=str(run.get('control') or '').upper()
+          stopped=bool(run.get('stopRequested'))
+          totals=data.get('totals') or run.get('totals') or {}
+          todo=int(totals.get('todo') or 0)
+          workers_count=max(0,int(run.get('workerCount') or 0))
+          max_minutes=int(run.get('maxMinutes') or 0)
+
+          workers_by_idx={}
+          for worker in data.get('workers') or []:
+              try:
+                  idx=int(worker.get('workerIndex'))
+              except Exception:
+                  continue
+              workers_by_idx[idx]=worker
+
+          terminal_statuses={'DONE','READY','OFFLINE'}
+          blocking=[]
+          for idx in range(workers_count):
+              worker=workers_by_idx.get(idx) or {}
+              same=str(worker.get('runId') or '') == target
+              ws=str(worker.get('status') or '').upper()
+              if not same or ws not in terminal_statuses:
+                  blocking.append(idx+1)
+          all_terminal=(len(blocking) == 0)
+
+          finished=parse_iso(run.get('finishedAt'))
+          now=datetime.now(timezone.utc)
+          cooldown=int(os.environ.get('COOLDOWN_SECONDS') or 310)
+          remaining=0
+          if finished:
+              remaining=max(0, int((finished.timestamp()+cooldown)-now.timestamp()+0.999))
+
+          print(
+              f'Diagnostica: current={current or "-"} target={target} status={status or "-"} '
+              f'todo={todo} maxMinutes={max_minutes} stop={stopped} control={control or "-"} '
+              f'allTerminal={all_terminal} blocking={blocking} cooldownRemaining={remaining}s',
+              file=sys.stderr
+          )
+
+          if current != target:
+              print('EXIT_REPLACED')
+              raise SystemExit
+          if control in {'STOP','PAUSE'} or stopped:
+              print('EXIT_STOPPED')
+              raise SystemExit
+          if todo <= 0:
+              print('EXIT_COMPLETE')
+              raise SystemExit
+          if max_minutes != 300:
+              print('EXIT_NOT_300')
+              raise SystemExit
+          if status != 'INCOMPLETE':
+              if status in {'RUNNING','CLOSING','WORKERS_DONE','STOPPING','PAUSING'}:
+                  print('RETRY')
+              else:
+                  print('EXIT_STATUS')
+              raise SystemExit
+          if not all_terminal:
+              print('RETRY')
+              raise SystemExit
+          if not finished:
+              print('RETRY')
+              raise SystemExit
+          if remaining > 0:
+              print(f'WAIT:{remaining}')
+              raise SystemExit
+          print('DISPATCH')
+          PY
+            )
+
+            case "$decision" in
+              EXIT_REPLACED)
+                echo 'Autorilancio non necessario: un nuovo run ha già sostituito quello precedente.'
+                exit 0
+                ;;
+              EXIT_STOPPED)
+                echo 'Autorilancio annullato: STOP/PAUSE richiesto.'
+                exit 0
+                ;;
+              EXIT_COMPLETE)
+                echo 'Autorilancio non necessario: coda completata.'
+                exit 0
+                ;;
+              EXIT_NOT_300)
+                echo 'Autorilancio non applicabile: non è un ciclo standard da 300 minuti.'
+                exit 0
+                ;;
+              EXIT_STATUS)
+                echo 'Autorilancio non applicabile allo stato terminale corrente.'
+                exit 0
+                ;;
+              RETRY)
+                echo 'Stato non ancora stabile: riprovo tra 30 secondi.'
+                sleep 30
+                continue
+                ;;
+              WAIT:*)
+                wait_seconds="${decision#WAIT:}"
+                if [ "$wait_seconds" -gt 30 ]; then wait_seconds=30; fi
+                if [ "$wait_seconds" -lt 1 ]; then wait_seconds=1; fi
+                echo "Cooldown 5 minuti ancora in corso: attendo ${wait_seconds}s."
+                sleep "$wait_seconds"
+                continue
+                ;;
+              DISPATCH)
+                ;;
+              *)
+                echo "Decisione inattesa: $decision"
+                sleep 30
+                continue
+                ;;
+            esac
+
+            if active_newer_collector; then
+              echo 'Nessun doppio avvio: il collector successivo è già stato accodato.'
+              exit 0
+            else
+              active_rc=$?
+              if [ "$active_rc" -eq 1 ]; then
+                echo 'Impossibile verificare i run GitHub più recenti; per sicurezza non duplico il dispatch e riprovo.'
+                sleep 30
+                continue
+              fi
+            fi
+
+            read -r worker_count max_minutes < <(python3 - <<'PY'
+          import json
+          data=json.load(open('/tmp/cloud-cycle-state.json'))
+          run=data.get('run') or {}
+          print(int(run.get('workerCount') or 10), int(run.get('maxMinutes') or 300))
+          PY
+            )
+
+            dispatch_payload=$(WORKER_COUNT="$worker_count" MAX_MINUTES="$max_minutes" python3 - <<'PY'
+          import json, os
+          print(json.dumps({
+              'ref':'main',
+              'inputs':{
+                  'workers':str(os.environ['WORKER_COUNT']),
+                  'max_minutes':str(os.environ['MAX_MINUTES']),
+                  'max_municipalities_per_worker':'0'
+              }
+          }))
+          PY
+            )
+
+            http_code=$(curl --silent --show-error --location \
+              --output /tmp/cloud-cycle-dispatch-response.txt \
+              --write-out '%{http_code}' \
+              --request POST \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              --header 'Content-Type: application/json' \
+              --data-binary "$dispatch_payload" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/cloud-collector.yml/dispatches")
+
+            if [ "$http_code" = '204' ]; then
+              echo "Nuovo ciclo da ${max_minutes} minuti accodato automaticamente dopo il cooldown."
+              exit 0
+            fi
+
+            echo "Dispatch GitHub non accettato: HTTP $http_code"
+            cat /tmp/cloud-cycle-dispatch-response.txt || true
+            exit 1
+          done
+
+          echo 'Autorilancio non eseguito: stato non diventato stabile entro la finestra di recovery.'
+          exit 1
