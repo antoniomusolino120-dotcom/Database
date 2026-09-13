@@ -11,7 +11,7 @@ permissions:
 
 concurrency:
   group: municipality-repair-2026-09-13
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   apply:
@@ -20,7 +20,7 @@ jobs:
       SHEET_ENDPOINT: ${{ secrets.SHEET_ENDPOINT }}
       APPLY: '1'
       START_NR: '1'
-      BATCH_SIZE: '100'
+      BATCH_SIZE: '25'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
