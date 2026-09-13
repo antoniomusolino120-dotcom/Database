@@ -28,5 +28,7 @@ jobs:
           node-version: 22
       - name: Require Sheet bridge
         run: test -n "$SHEET_ENDPOINT" || (echo 'Missing repository secret SHEET_ENDPOINT' && exit 1)
+      - name: Give previous run time to stop
+        run: sleep 30
       - name: Validate and rebuild municipality list
         run: node cloud/repair-municipalities.mjs
