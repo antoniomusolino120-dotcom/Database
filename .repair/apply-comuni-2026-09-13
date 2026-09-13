@@ -1,5 +1,5 @@
-apply exact user municipality list 2026-09-13 retry codec
+apply final identity patch 2026-09-13
 final rows: 7894
 completed preserved: 1717
 todo: 6177
-patch rows: 2385
+remaining identity rows: 635
