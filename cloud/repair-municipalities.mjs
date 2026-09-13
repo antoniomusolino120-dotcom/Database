@@ -6,6 +6,7 @@ const BATCH_SIZE = Math.max(25, Math.min(200, Number(process.env.BATCH_SIZE || 1
 
 const SUT_URL = 'https://raw.githubusercontent.com/aborruso/archivioDatiPubbliciPreziosi/36f99cc057ebef653b44c8ba8b921e8b81a656bc/docs/sistemaUnicoTerritoriale/comuniSistemaUnicoTerritoriale.csv';
 const AUX_URL = 'https://raw.githubusercontent.com/opendatasicilia/comuni-italiani/af99645c2f83d5734e7aca526f2c0355a5c0fef8/dati/comuni.csv';
+const PROVINCES_URL = 'https://raw.githubusercontent.com/samuelefrasca/Province-Italia/1ac4373fffef58c97754d5fb5e68ade3b336a271/data/province.json';
 
 function parseCsv(text) {
   const rows = [];
@@ -26,7 +27,7 @@ function parseCsv(text) {
 }
 
 async function fetchText(url) {
-  const res = await fetch(url, { headers: { 'user-agent': 'Database municipality repair/1.0' } });
+  const res = await fetch(url, { headers: { 'user-agent': 'Database municipality repair/1.1' } });
   if (!res.ok) throw new Error(`Fetch ${url} -> HTTP ${res.status}`);
   return res.text();
 }
@@ -46,13 +47,12 @@ function parseSut(text) {
   const iName = idx('DESCRIZIONE COMUNE');
   const iSigla = idx('SIGLA');
   const iIstat = idx('CODICE ISTAT');
-  const rows = csv.map(r => ({
+  return csv.map(r => ({
     nr: Number(r[iNr]),
     sourceName: clean(r[iName]),
     provinceCode: upper(r[iSigla]),
     municipalityId: clean(r[iIstat]).padStart(6, '0'),
   }));
-  return rows;
 }
 
 function parseAux(text) {
@@ -65,23 +65,30 @@ function parseAux(text) {
   };
   const iName = idx('comune');
   const iId = idx('pro_com_t');
-  const iProvince = idx('den_prov');
-  const iSigla = idx('sigla');
-  const iRegion = idx('den_reg');
   const byId = new Map();
-  const bySigla = new Map();
   for (const r of csv) {
-    const item = {
-      name: clean(r[iName]),
-      municipalityId: clean(r[iId]).padStart(6, '0'),
-      province: clean(r[iProvince]),
-      provinceCode: upper(r[iSigla]),
-      region: clean(r[iRegion]),
-    };
-    if (item.municipalityId) byId.set(item.municipalityId, item);
-    if (item.provinceCode && item.province && item.region && !bySigla.has(item.provinceCode)) bySigla.set(item.provinceCode, item);
+    const municipalityId = clean(r[iId]).padStart(6, '0');
+    const name = clean(r[iName]);
+    if (municipalityId && name) byId.set(municipalityId, { municipalityId, name });
   }
-  return { byId, bySigla };
+  return { byId };
+}
+
+function parseProvinces(text) {
+  const parsed = JSON.parse(text);
+  const bySigla = new Map();
+  for (const [regionName, items] of Object.entries(parsed || {})) {
+    for (const item of Array.isArray(items) ? items : []) {
+      const sigla = upper(item?.sigla);
+      const province = clean(item?.nome);
+      const region = clean(item?.regione || regionName);
+      if (!sigla || !province || !region) continue;
+      if (bySigla.has(sigla)) throw new Error(`Sigla provincia duplicata nella fonte province: ${sigla}`);
+      bySigla.set(sigla, { province, region });
+    }
+  }
+  if (bySigla.size < 100) throw new Error(`Fonte province incompleta: solo ${bySigla.size} sigle`);
+  return bySigla;
 }
 
 function canonicalName(sut, aux) {
@@ -142,19 +149,24 @@ async function post(action, payload = {}) {
   throw last;
 }
 
-const [sutText, auxText] = await Promise.all([fetchText(SUT_URL), fetchText(AUX_URL)]);
+const [sutText, auxText, provincesText] = await Promise.all([
+  fetchText(SUT_URL),
+  fetchText(AUX_URL),
+  fetchText(PROVINCES_URL),
+]);
 const source = parseSut(sutText);
 assertSource(source);
 const aux = parseAux(auxText);
+const provinces = parseProvinces(provincesText);
 
 const normalized = source.map(sut => {
-  const byId = aux.byId.get(sut.municipalityId);
-  const geo = byId || aux.bySigla.get(sut.provinceCode);
+  const auxRow = aux.byId.get(sut.municipalityId);
+  const geo = provinces.get(sut.provinceCode);
   if (!geo?.province || !geo?.region) throw new Error(`Provincia/regione non risolta per ${sut.nr} ${sut.sourceName} ${sut.municipalityId} ${sut.provinceCode}`);
   return {
     queueCode: `COMUNE-${String(sut.nr).padStart(5, '0')}`,
     municipalityId: sut.municipalityId,
-    name: canonicalName(sut, byId),
+    name: canonicalName(sut, auxRow),
     province: geo.province,
     provinceCode: sut.provinceCode,
     region: geo.region,
@@ -174,6 +186,7 @@ if (suffix.length !== EXPECTED_TOTAL - START_NR + 1) throw new Error(`Suffix ina
 console.log(JSON.stringify({
   mode: APPLY ? 'apply' : 'validate',
   sourceCount: source.length,
+  provinceCount: provinces.size,
   startNr: START_NR,
   suffixCount: suffix.length,
   first: suffix[0],
