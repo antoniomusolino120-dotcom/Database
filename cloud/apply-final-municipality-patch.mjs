@@ -1,4 +1,4 @@
-import { gunzipSync } from 'node:zlib';
+import { gunzipSync, inflateSync, inflateRawSync, brotliDecompressSync } from 'node:zlib';
 import { FINAL_PATCH_GZIP_BASE64 } from './comuni-final-patch-2026-09-13.mjs';
 
 const ENDPOINT = String(process.env.SHEET_ENDPOINT || '').trim();
@@ -31,9 +31,36 @@ async function post(action, payload = {}) {
   throw last;
 }
 
-const patch = JSON.parse(
-  gunzipSync(Buffer.from(FINAL_PATCH_GZIP_BASE64, 'base64')).toString('utf8')
-);
+function decodePatch() {
+  const buf = Buffer.from(FINAL_PATCH_GZIP_BASE64, 'base64');
+  const decoders = [
+    ['gzip', gunzipSync],
+    ['zlib', inflateSync],
+    ['deflate-raw', inflateRawSync],
+    ['brotli', brotliDecompressSync],
+  ];
+  const errors = [];
+  for (const [name, fn] of decoders) {
+    try {
+      const text = fn(buf).toString('utf8');
+      const parsed = JSON.parse(text);
+      console.log(`patch codec: ${name}`);
+      return parsed;
+    } catch (err) {
+      errors.push(`${name}: ${err?.message || err}`);
+    }
+  }
+  try {
+    const parsed = JSON.parse(buf.toString('utf8'));
+    console.log('patch codec: raw-json');
+    return parsed;
+  } catch (err) {
+    errors.push(`raw-json: ${err?.message || err}`);
+  }
+  throw new Error(`Impossibile decodificare patch (${buf.length} bytes, head=${buf.subarray(0,8).toString('hex')}): ${errors.join(' | ')}`);
+}
+
+const patch = decodePatch();
 const entries = Object.entries(patch);
 if (entries.length !== EXPECTED_PATCH_ROWS) {
   throw new Error(`Patch inattesa: ${entries.length} righe, attese ${EXPECTED_PATCH_ROWS}`);
