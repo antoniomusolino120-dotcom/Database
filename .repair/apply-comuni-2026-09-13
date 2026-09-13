@@ -1,4 +1,4 @@
-apply 2026-09-13 continue fixed rebuild
+apply 2026-09-13 continue safe rebuild
 validated source count: 7894
-resume from source NR 176
-batch size: 50
+resume from source NR 251
+batch size: 25
