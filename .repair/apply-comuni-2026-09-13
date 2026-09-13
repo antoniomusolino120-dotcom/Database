@@ -1,4 +1,4 @@
-apply 2026-09-13 continue safe rebuild
+apply 2026-09-13 final one-shot rebuild
 validated source count: 7894
-resume from source NR 251
-batch size: 25
+resume from source NR 376
+batch size: 7519
