@@ -1,0 +1,26 @@
+name: Validate municipality repair
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'cloud/repair-municipalities.mjs'
+      - '.github/workflows/repair-municipalities-validate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Validate current 7,894 municipalities
+        env:
+          APPLY: '0'
+          START_NR: '1790'
+        run: node cloud/repair-municipalities.mjs
