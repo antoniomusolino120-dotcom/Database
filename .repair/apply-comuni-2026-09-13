@@ -1,4 +1,4 @@
-apply exact user municipality list 2026-09-13
+apply exact user municipality list 2026-09-13 retry codec
 final rows: 7894
 completed preserved: 1717
 todo: 6177
