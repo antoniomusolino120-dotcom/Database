@@ -2,7 +2,7 @@ const EXPECTED_TOTAL = 7894;
 const START_NR = Number(process.env.START_NR || 1);
 const APPLY = String(process.env.APPLY || '') === '1';
 const ENDPOINT = String(process.env.SHEET_ENDPOINT || '').trim();
-const BATCH_SIZE = Math.max(10, Math.min(50, Number(process.env.BATCH_SIZE || 25)));
+const BATCH_SIZE = Math.max(10, Math.min(10000, Number(process.env.BATCH_SIZE || 25)));
 
 const SUT_URL = 'https://raw.githubusercontent.com/aborruso/archivioDatiPubbliciPreziosi/36f99cc057ebef653b44c8ba8b921e8b81a656bc/docs/sistemaUnicoTerritoriale/comuniSistemaUnicoTerritoriale.csv';
 const AUX_URL = 'https://raw.githubusercontent.com/opendatasicilia/comuni-italiani/af99645c2f83d5734e7aca526f2c0355a5c0fef8/dati/comuni.csv';
