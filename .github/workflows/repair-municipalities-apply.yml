@@ -1,0 +1,32 @@
+name: Apply municipality repair
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.repair/apply-comuni-2026-09-13'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: municipality-repair-2026-09-13
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    env:
+      SHEET_ENDPOINT: ${{ secrets.SHEET_ENDPOINT }}
+      APPLY: '1'
+      START_NR: '1790'
+      BATCH_SIZE: '100'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Require Sheet bridge
+        run: test -n "$SHEET_ENDPOINT" || (echo 'Missing repository secret SHEET_ENDPOINT' && exit 1)
+      - name: Validate and rebuild municipality suffix
+        run: node cloud/repair-municipalities.mjs
