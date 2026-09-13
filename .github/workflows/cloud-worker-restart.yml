@@ -82,10 +82,10 @@ jobs:
         working-directory: findmyink-collector
         run: npm install
 
-      - name: Run restarted worker
+      - name: Run restarted resilient worker
         working-directory: findmyink-collector
         shell: bash
-        run: xvfb-run -a npx electron --no-sandbox --disable-setuid-sandbox cloud/worker.mjs
+        run: xvfb-run -a npx electron --no-sandbox --disable-setuid-sandbox cloud/worker-bridge-resilience.mjs
 
       - name: Upload worker diagnostics
         if: always()
@@ -95,16 +95,3 @@ jobs:
           path: findmyink-collector/cloud-output/worker-${{ inputs.worker_index }}-g${{ inputs.generation }}.json
           if-no-files-found: warn
           retention-days: 1
-
-      - name: Reconcile run state
-        if: always()
-        shell: bash
-        run: |
-          payload=$(python3 - <<'PY'
-          import json, os
-          print(json.dumps({"action":"closeCloudRun","runId":os.environ["RUN_ID"],"workflowResult":"success"}))
-          PY
-          )
-          curl --silent --show-error --location --connect-timeout 15 --max-time 60 \
-            -H 'Content-Type: text/plain;charset=utf-8' \
-            --data-binary "$payload" "$SHEET_ENDPOINT" || true
