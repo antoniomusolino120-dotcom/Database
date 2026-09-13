@@ -1,14 +1,14 @@
 const EXPECTED_TOTAL = 7894;
-const START_NR = Number(process.env.START_NR || 1790);
+const START_NR = Number(process.env.START_NR || 1);
 const APPLY = String(process.env.APPLY || '') === '1';
 const ENDPOINT = String(process.env.SHEET_ENDPOINT || '').trim();
-const BATCH_SIZE = Math.max(25, Math.min(200, Number(process.env.BATCH_SIZE || 100)));
+const BATCH_SIZE = Math.max(10, Math.min(50, Number(process.env.BATCH_SIZE || 25)));
 
 const SUT_URL = 'https://raw.githubusercontent.com/aborruso/archivioDatiPubbliciPreziosi/36f99cc057ebef653b44c8ba8b921e8b81a656bc/docs/sistemaUnicoTerritoriale/comuniSistemaUnicoTerritoriale.csv';
 const AUX_URL = 'https://raw.githubusercontent.com/opendatasicilia/comuni-italiani/af99645c2f83d5734e7aca526f2c0355a5c0fef8/dati/comuni.csv';
 const PROVINCES_URL = 'https://raw.githubusercontent.com/samuelefrasca/Province-Italia/1ac4373fffef58c97754d5fb5e68ade3b336a271/data/province.json';
 const PROVINCE_CODE_ALIASES = new Map([
-  ['CI', 'SU'], // legacy Carbonia-Iglesias -> current Sulcis Iglesiente
+  ['CI', 'SU'],
 ]);
 
 function parseCsv(text) {
@@ -30,7 +30,7 @@ function parseCsv(text) {
 }
 
 async function fetchText(url) {
-  const res = await fetch(url, { headers: { 'user-agent': 'Database municipality repair/1.2' } });
+  const res = await fetch(url, { headers: { 'user-agent': 'Database municipality repair/1.3' } });
   if (!res.ok) throw new Error(`Fetch ${url} -> HTTP ${res.status}`);
   return res.text();
 }
@@ -40,6 +40,11 @@ function upper(v) { return clean(v).toLocaleUpperCase('it-IT'); }
 function currentProvinceCode(v) {
   const code = upper(v);
   return PROVINCE_CODE_ALIASES.get(code) || code;
+}
+function sheetMunicipalityId(v) {
+  const raw = clean(v);
+  const stripped = raw.replace(/^0+(?=\d)/, '');
+  return stripped || '0';
 }
 
 function parseSut(text) {
@@ -173,7 +178,7 @@ const normalized = source.map(sut => {
   if (!geo?.province || !geo?.region) throw new Error(`Provincia/regione non risolta per ${sut.nr} ${sut.sourceName} ${sut.municipalityId} ${sut.provinceCode}`);
   return {
     queueCode: `COMUNE-${String(sut.nr).padStart(5, '0')}`,
-    municipalityId: sut.municipalityId,
+    municipalityId: sheetMunicipalityId(sut.municipalityId),
     name: canonicalName(sut, auxRow),
     province: geo.province,
     provinceCode: sut.provinceCode,
@@ -207,5 +212,5 @@ if (APPLY) {
     await post('upsertMunicipalities', { rows: batch });
     console.log(`written ${Math.min(i + batch.length, suffix.length)}/${suffix.length}`);
   }
-  console.log('Municipality suffix rebuild complete.');
+  console.log('Municipality rebuild complete.');
 }
