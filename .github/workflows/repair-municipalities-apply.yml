@@ -19,8 +19,8 @@ jobs:
     env:
       SHEET_ENDPOINT: ${{ secrets.SHEET_ENDPOINT }}
       APPLY: '1'
-      START_NR: '176'
-      BATCH_SIZE: '50'
+      START_NR: '251'
+      BATCH_SIZE: '25'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
