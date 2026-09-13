@@ -1,4 +1,4 @@
-apply 2026-09-13 fixed idempotent rebuild
+apply 2026-09-13 continue fixed rebuild
 validated source count: 7894
-rebuild full list from source NR 1
-batch size: 25
+resume from source NR 176
+batch size: 50
