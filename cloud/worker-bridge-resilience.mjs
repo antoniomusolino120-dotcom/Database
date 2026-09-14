@@ -49,7 +49,7 @@ globalThis.fetch=async function resilientFetch(input,init={}){
 // allow "ink..." only from the business name at a word boundary, never from a
 // generic website such as linktr.ee.
 const workerUrl=new URL('./worker.mjs',import.meta.url);
-const workerSource=await fs.readFile(workerUrl,'utf8');
+let workerSource=await fs.readFile(workerUrl,'utf8');
 const oldFilter="function isTattoo(item){const hay=`${item?.name||''} ${item?.address||''} ${item?.website||''}`.toLowerCase();return /tattoo|tatu|tatou|ink/.test(hay);}";
 const newFilter="function isTattoo(item){const name=String(item?.name||'').toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g,'');const hay=`${name} ${item?.address||''} ${item?.website||''}`.toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g,'');const strong=/tattoo|tatou|tatuagg|tatuator|tatuatric/.test(hay);const inkName=/\\bink[a-z0-9]*/.test(name);return strong||inkName;}";
 if(!workerSource.includes(oldFilter))throw new Error('Tattoo filter patch target not found in worker.mjs');
@@ -71,6 +71,17 @@ const checks=[
   [filterCheck({name:'InkLab'}),true,'ink-brand'],
 ];
 for(const [actual,expected,label] of checks){if(actual!==expected)throw new Error(`Tattoo filter self-test failed: ${label}`);}
-await fs.writeFile(workerUrl,workerSource.replace(oldFilter,newFilter));
+workerSource=workerSource.replace(oldFilter,newFilter);
+
+// The base worker treats every noncritical forced heartbeat as eligible after only
+// five seconds. With ten workers this can create a burst of Apps Script writes
+// between Maps queries. Keep critical transitions immediate, but throttle these
+// progress-only forced heartbeats to twenty seconds. The 900s lease is unchanged.
+const oldHeartbeatThrottle="(!force&&age<HEARTBEAT_INTERVAL_MS)||(force&&age<5000)";
+const newHeartbeatThrottle="(!force&&age<HEARTBEAT_INTERVAL_MS)||(force&&age<20000)";
+if(!workerSource.includes(oldHeartbeatThrottle))throw new Error('Heartbeat throttle patch target not found in worker.mjs');
+workerSource=workerSource.replace(oldHeartbeatThrottle,newHeartbeatThrottle);
+
+await fs.writeFile(workerUrl,workerSource);
 
 await import('./worker.mjs');
