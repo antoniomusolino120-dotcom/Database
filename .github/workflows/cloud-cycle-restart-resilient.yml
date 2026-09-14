@@ -25,7 +25,7 @@ concurrency:
 jobs:
   cycle-restart:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 130
     env:
       SHEET_ENDPOINT: ${{ secrets.SHEET_ENDPOINT }}
       TARGET_RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id || '34752297332' }}
@@ -78,9 +78,9 @@ jobs:
           PY
           }
 
-          for attempt in $(seq 1 30); do
-            echo "State check $attempt/30"
-            curl --silent --show-error --location --connect-timeout 15 --max-time 45 \
+          for attempt in $(seq 1 120); do
+            echo "State check $attempt/120"
+            curl --silent --show-error --location --connect-timeout 10 --max-time 20 \
               -H 'Content-Type: text/plain;charset=utf-8' \
               --data-binary "$state_payload" \
               "$SHEET_ENDPOINT" > /tmp/cloud-cycle-state.json 2>/tmp/cloud-cycle-state.err || true
@@ -281,5 +281,5 @@ jobs:
             exit 1
           done
 
-          echo 'Autorilancio non eseguito: stato non diventato stabile entro la finestra di recovery.'
+          echo 'Autorilancio non eseguito: stato non diventato stabile entro la finestra di recovery estesa.'
           exit 1
