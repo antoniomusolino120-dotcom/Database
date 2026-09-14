@@ -40,8 +40,8 @@ jobs:
       MAX_MINUTES: '330'
       MAX_MUNICIPALITIES_PER_WORKER: '0'
       LEASE_SECONDS: '900'
-      HEARTBEAT_INTERVAL_MS: '30000'
-      PREVIEW_INTERVAL_MS: '60000'
+      HEARTBEAT_INTERVAL_MS: '60000'
+      PREVIEW_INTERVAL_MS: '120000'
       OUTPUT_PATH: cloud-output/worker-${{ inputs.worker_index }}-g${{ inputs.generation }}.json
       ELECTRON_DISABLE_SECURITY_WARNINGS: 'true'
     steps:
