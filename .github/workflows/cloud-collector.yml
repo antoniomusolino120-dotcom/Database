@@ -464,8 +464,8 @@ jobs:
           from datetime import datetime, timezone
           data=json.load(open('/tmp/cloud-state.json'))
           run=data.get('run') or {}
-          console=data.get('console') or {}
           totals=data.get('totals') or run.get('totals') or {}
+          workers=data.get('workers') or []
 
           def parse_iso(value):
               value=str(value or '').strip()
@@ -482,17 +482,31 @@ jobs:
           status=str(run.get('status','')).upper()
           control=str(run.get('control','')).upper()
           stopped=bool(run.get('stopRequested'))
-          ready=console.get('readyForStart') is True
           todo=int(totals.get('todo') or 0)
+          worker_count=max(0,int(run.get('workerCount') or os.environ.get('WORKER_COUNT') or 0))
+          terminal={'DONE','READY','OFFLINE'}
+          workers_by_idx={}
+          for worker in workers:
+              try:
+                  idx=int(worker.get('workerIndex'))
+              except Exception:
+                  continue
+              workers_by_idx[idx]=worker
+          ready=worker_count > 0 and all(
+              idx in workers_by_idx
+              and str(workers_by_idx[idx].get('runId','')) == os.environ['RUN_ID']
+              and str(workers_by_idx[idx].get('status','')).upper() in terminal
+              for idx in range(worker_count)
+          )
           eligible=(data.get('ok') is True and same_run and status == 'INCOMPLETE' and expired and not control and not stopped and ready and todo > 0)
           print('true' if eligible else 'false')
           PY
           )
           echo "restart=$restart" >> "$GITHUB_OUTPUT"
           if [ "$restart" = 'true' ]; then
-            echo 'Run da 300 minuti terminato, worker tutti fermi e coda ancora aperta.'
+            echo 'Run da 300 minuti terminato, worker tutti terminali e coda ancora aperta.'
           else
-            echo 'Nessun autorilancio: run non scaduto, fermato/pausato, sostituito o coda completata.'
+            echo 'Nessun autorilancio: run non scaduto, worker non terminali, fermato/pausato, sostituito o coda completata.'
           fi
 
       - name: Five minute cooldown
@@ -549,21 +563,35 @@ jobs:
           import json, os
           data=json.load(open('/tmp/cloud-state-after-cooldown.json'))
           run=data.get('run') or {}
-          console=data.get('console') or {}
           totals=data.get('totals') or run.get('totals') or {}
+          workers=data.get('workers') or []
           same_run=str(run.get('runId','')) == os.environ['RUN_ID']
           status=str(run.get('status','')).upper()
           control=str(run.get('control','')).upper()
           stopped=bool(run.get('stopRequested'))
-          ready=console.get('readyForStart') is True
           todo=int(totals.get('todo') or 0)
+          worker_count=max(0,int(run.get('workerCount') or os.environ.get('WORKER_COUNT') or 0))
+          terminal={'DONE','READY','OFFLINE'}
+          workers_by_idx={}
+          for worker in workers:
+              try:
+                  idx=int(worker.get('workerIndex'))
+              except Exception:
+                  continue
+              workers_by_idx[idx]=worker
+          ready=worker_count > 0 and all(
+              idx in workers_by_idx
+              and str(workers_by_idx[idx].get('runId','')) == os.environ['RUN_ID']
+              and str(workers_by_idx[idx].get('status','')).upper() in terminal
+              for idx in range(worker_count)
+          )
           eligible=(data.get('ok') is True and same_run and status == 'INCOMPLETE' and not control and not stopped and ready and todo > 0)
           print('true' if eligible else 'false')
           PY
           )
 
           if [ "$restart" != 'true' ]; then
-            echo 'Autorilancio annullato durante i 5 minuti: lo stato del sistema è cambiato.'
+            echo 'Autorilancio annullato durante i 5 minuti: lo stato del sistema è cambiato o i worker non sono tutti terminali.'
             exit 0
           fi
 
