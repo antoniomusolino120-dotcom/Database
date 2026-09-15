@@ -407,7 +407,7 @@ jobs:
     needs: [close]
     if: ${{ always() && needs.close.result == 'success' && inputs.max_minutes == '300' && inputs.max_municipalities_per_worker == '0' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 25
     env:
       SHEET_ENDPOINT: ${{ secrets.SHEET_ENDPOINT }}
       RUN_ID: ${{ github.run_id }}
@@ -422,10 +422,42 @@ jobs:
         run: |
           set -euo pipefail
           payload='{"action":"getCloudDashboardState","previewTimes":{}}'
-          curl --fail-with-body --silent --show-error --location --connect-timeout 15 --max-time 75 \
-            -H 'Content-Type: text/plain;charset=utf-8' \
-            --data-binary "$payload" \
-            "$SHEET_ENDPOINT" > /tmp/cloud-state.json
+
+          valid_bridge_state() {
+            FILE="$1" python3 - <<'PY'
+          import json, os, sys
+          try:
+              data=json.load(open(os.environ['FILE']))
+          except Exception:
+              sys.exit(1)
+          sys.exit(0 if data.get('ok') is True else 1)
+          PY
+          }
+
+          bridge_state() {
+            target="$1"
+            errfile="$2"
+            for attempt in $(seq 1 6); do
+              echo "Bridge restart gate attempt $attempt/6"
+              : > "$target"
+              : > "$errfile"
+              curl --silent --show-error --location --connect-timeout 15 --max-time 45 \
+                -H 'Content-Type: text/plain;charset=utf-8' \
+                --data-binary "$payload" \
+                "$SHEET_ENDPOINT" > "$target" 2> "$errfile" || true
+              if valid_bridge_state "$target"; then
+                return 0
+              fi
+              test -s "$errfile" && cat "$errfile" || true
+              if [ "$attempt" -lt 6 ]; then sleep 10; fi
+            done
+            return 1
+          }
+
+          if ! bridge_state /tmp/cloud-state.json /tmp/cloud-state.err; then
+            echo 'Impossibile verificare lo stato dopo 6 tentativi: non abbandono al primo timeout, ma blocco il dispatch per sicurezza.'
+            exit 1
+          fi
 
           restart=$(python3 - <<'PY'
           import json, os
@@ -476,10 +508,42 @@ jobs:
         run: |
           set -euo pipefail
           payload='{"action":"getCloudDashboardState","previewTimes":{}}'
-          curl --fail-with-body --silent --show-error --location --connect-timeout 15 --max-time 75 \
-            -H 'Content-Type: text/plain;charset=utf-8' \
-            --data-binary "$payload" \
-            "$SHEET_ENDPOINT" > /tmp/cloud-state-after-cooldown.json
+
+          valid_bridge_state() {
+            FILE="$1" python3 - <<'PY'
+          import json, os, sys
+          try:
+              data=json.load(open(os.environ['FILE']))
+          except Exception:
+              sys.exit(1)
+          sys.exit(0 if data.get('ok') is True else 1)
+          PY
+          }
+
+          bridge_state() {
+            target="$1"
+            errfile="$2"
+            for attempt in $(seq 1 6); do
+              echo "Bridge post-cooldown check $attempt/6"
+              : > "$target"
+              : > "$errfile"
+              curl --silent --show-error --location --connect-timeout 15 --max-time 45 \
+                -H 'Content-Type: text/plain;charset=utf-8' \
+                --data-binary "$payload" \
+                "$SHEET_ENDPOINT" > "$target" 2> "$errfile" || true
+              if valid_bridge_state "$target"; then
+                return 0
+              fi
+              test -s "$errfile" && cat "$errfile" || true
+              if [ "$attempt" -lt 6 ]; then sleep 10; fi
+            done
+            return 1
+          }
+
+          if ! bridge_state /tmp/cloud-state-after-cooldown.json /tmp/cloud-state-after-cooldown.err; then
+            echo 'Stato non verificabile dopo il cooldown: nessun doppio avvio o dispatch cieco.'
+            exit 1
+          fi
 
           restart=$(python3 - <<'PY'
           import json, os
@@ -516,20 +580,28 @@ jobs:
           PY
           )
 
-          http_code=$(curl --silent --show-error --location \
-            --output /tmp/dispatch-response.txt \
-            --write-out '%{http_code}' \
-            --request POST \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header 'Accept: application/vnd.github+json' \
-            --header 'X-GitHub-Api-Version: 2022-11-28' \
-            --header 'Content-Type: application/json' \
-            --data-binary "$dispatch_payload" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/cloud-collector.yml/dispatches")
-
-          if [ "$http_code" != '204' ]; then
-            echo "Autorilancio GitHub fallito: HTTP $http_code"
+          http_code='000'
+          for attempt in $(seq 1 3); do
+            echo "GitHub dispatch attempt $attempt/3"
+            http_code=$(curl --silent --show-error --location \
+              --connect-timeout 15 --max-time 45 \
+              --output /tmp/dispatch-response.txt \
+              --write-out '%{http_code}' \
+              --request POST \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              --header 'Content-Type: application/json' \
+              --data-binary "$dispatch_payload" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/cloud-collector.yml/dispatches" || echo '000')
+            if [ "$http_code" = '204' ]; then
+              echo 'Nuovo ciclo da 300 minuti accodato automaticamente.'
+              exit 0
+            fi
+            echo "Dispatch non accettato: HTTP $http_code"
             cat /tmp/dispatch-response.txt || true
-            exit 1
-          fi
-          echo 'Nuovo ciclo da 300 minuti accodato automaticamente.'
+            if [ "$attempt" -lt 3 ]; then sleep 10; fi
+          done
+
+          echo 'Autorilancio GitHub fallito dopo 3 tentativi.'
+          exit 1
