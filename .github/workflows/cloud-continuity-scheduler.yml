@@ -16,14 +16,16 @@ concurrency:
 jobs:
   ensure-continuity:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     env:
       GH_TOKEN: ${{ github.token }}
+      SHEET_ENDPOINT: ${{ secrets.SHEET_ENDPOINT }}
     steps:
       - name: Recover latest stopped collector
         shell: bash
         run: |
           set -euo pipefail
+          test -n "$SHEET_ENDPOINT" || (echo 'Missing repository secret SHEET_ENDPOINT' && exit 1)
 
           api_headers=(
             --header "Authorization: Bearer $GH_TOKEN"
@@ -37,44 +39,101 @@ jobs:
             "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/cloud-collector.yml/runs?event=workflow_dispatch&per_page=20" \
             > /tmp/collector-runs.json
 
-          decision=$(python3 - <<'PY'
+          collector=$(python3 - <<'PY'
           import json
-
           data=json.load(open('/tmp/collector-runs.json'))
-          runs=data.get('workflow_runs') or []
+          runs=sorted(data.get('workflow_runs') or [], key=lambda r:int(r.get('id') or 0), reverse=True)
           if not runs:
               print('NONE')
               raise SystemExit
-
-          runs=sorted(runs, key=lambda r:int(r.get('id') or 0), reverse=True)
           active=[r for r in runs if str(r.get('status') or '').lower() != 'completed']
           if active:
               newest=max(active, key=lambda r:int(r.get('id') or 0))
               print(f"ACTIVE:{newest.get('id')}")
               raise SystemExit
-
-          latest=runs[0]
-          print(f"RECOVER:{latest.get('id')}")
+          print(f"STOPPED:{runs[0].get('id')}")
           PY
           )
 
-          case "$decision" in
+          case "$collector" in
             NONE)
               echo 'Nessun collector precedente da recuperare.'
               exit 0
               ;;
             ACTIVE:*)
-              echo "Collector già attivo: ${decision#ACTIVE:}. Nessuna azione."
+              echo "Collector già attivo: ${collector#ACTIVE:}. Nessuna azione."
               exit 0
               ;;
-            RECOVER:*)
-              target_run_id="${decision#RECOVER:}"
+            STOPPED:*)
+              target_run_id="${collector#STOPPED:}"
               ;;
             *)
-              echo "Decisione inattesa: $decision"
+              echo "Decisione collector inattesa: $collector"
               exit 1
               ;;
           esac
+
+          state_payload='{"action":"getCloudDashboardState","previewTimes":{}}'
+          state_ok='false'
+          for attempt in 1 2 3; do
+            : > /tmp/continuity-state.json
+            curl --silent --show-error --location \
+              --connect-timeout 10 --max-time 30 \
+              -H 'Content-Type: text/plain;charset=utf-8' \
+              --data-binary "$state_payload" \
+              "$SHEET_ENDPOINT" > /tmp/continuity-state.json 2>/tmp/continuity-state.err || true
+
+            if python3 - <<'PY'
+          import json, sys
+          try:
+              data=json.load(open('/tmp/continuity-state.json'))
+          except Exception:
+              sys.exit(1)
+          sys.exit(0 if data.get('ok') is True else 1)
+          PY
+            then
+              state_ok='true'
+              break
+            fi
+            echo "Bridge continuity check $attempt/3 non riuscito."
+            test -s /tmp/continuity-state.err && cat /tmp/continuity-state.err || true
+            sleep 10
+          done
+
+          if [ "$state_ok" != 'true' ]; then
+            echo 'Stato centrale non verificabile: nessun dispatch cieco.'
+            exit 1
+          fi
+
+          queue_decision=$(TARGET_RUN_ID="$target_run_id" python3 - <<'PY'
+          import json, os
+          data=json.load(open('/tmp/continuity-state.json'))
+          run=data.get('run') or {}
+          totals=data.get('totals') or run.get('totals') or {}
+          current=str(run.get('runId') or '')
+          target=str(os.environ['TARGET_RUN_ID'])
+          status=str(run.get('status') or '').upper()
+          control=str(run.get('control') or '').upper()
+          stopped=bool(run.get('stopRequested'))
+          todo=int(totals.get('todo') or 0)
+
+          if current != target:
+              print(f'NOOP:run corrente {current or "-"} diverso da {target}')
+          elif control in {'STOP','PAUSE'} or stopped:
+              print('NOOP:STOP/PAUSE richiesto')
+          elif todo <= 0:
+              print('NOOP:coda completata')
+          elif status != 'INCOMPLETE':
+              print(f'NOOP:stato {status or "-"}')
+          else:
+              print('RECOVER')
+          PY
+          )
+
+          if [ "$queue_decision" != 'RECOVER' ]; then
+            echo "${queue_decision#NOOP:}"
+            exit 0
+          fi
 
           curl --fail-with-body --silent --show-error --location \
             --connect-timeout 15 --max-time 45 \
